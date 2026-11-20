@@ -49,11 +49,21 @@ WORKDIR /home/nntp-proxy
 # Expose default proxy port
 EXPOSE 8119
 
+# Web admin UI port. Nothing binds here unless NNTP_PROXY_WEB_LISTEN is set;
+# the listener is enabled at runtime, not by the entrypoint.
+EXPOSE 8080
+
 # Environment variables
 # Proxy settings
 ENV NNTP_PROXY_PORT=8119 \
     NNTP_PROXY_CONFIG=/etc/nntp-proxy/config.toml \
     RUST_LOG=info
+
+# Web admin UI (optional - disabled while NNTP_PROXY_WEB_LISTEN is unset).
+# Set NNTP_PROXY_WEB_TOKEN too; if it is unset the proxy generates a token and
+# logs it once. See docs/operator/web-ui.md.
+# ENV NNTP_PROXY_WEB_LISTEN=0.0.0.0:8080
+# ENV NNTP_PROXY_WEB_TOKEN=change-me-to-a-long-random-token
 
 # Backend server configuration (example - override these)
 # Server 0 (required if no config file)

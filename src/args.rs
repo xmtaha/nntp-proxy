@@ -87,6 +87,19 @@ pub struct CommonArgs {
     )]
     pub tui_attach: Option<SocketAddr>,
 
+    /// Bind address for the optional web admin UI (for example 0.0.0.0:8080).
+    ///
+    /// Leave unset to disable the web UI. The admin token comes from
+    /// `NNTP_PROXY_WEB_TOKEN`; when unset a random token is generated and
+    /// logged once at startup.
+    #[arg(
+        long = "web-listen",
+        value_name = "IP:PORT",
+        env = "NNTP_PROXY_WEB_LISTEN",
+        help_heading = "General"
+    )]
+    pub web_listen: Option<SocketAddr>,
+
     /// Port to listen on (overrides config file)
     #[arg(
         short,
@@ -691,6 +704,7 @@ mod tests {
             headless: false,
             tui_listen: None,
             tui_attach: None,
+            web_listen: None,
             port: None,
             host: None,
             routing_mode: None,

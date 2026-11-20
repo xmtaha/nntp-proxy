@@ -6,11 +6,24 @@ services:
     container_name: nntp-proxy
     ports:
       - "8119:8119"
+      # Web admin UI (optional). Bound to loopback on the host by default:
+      # the token travels in plain HTTP, so prefer a TLS reverse proxy over
+      # changing this to 0.0.0.0. Comment the mapping and NNTP_PROXY_WEB_LISTEN
+      # out together to disable the UI.
+      - "127.0.0.1:8080:8080"
     environment:
       # Proxy configuration (these match the CLI/env args in src/args.rs)
       NNTP_PROXY_PORT: 8119
       # NNTP_PROXY_THREADS: 4  # Optional: worker threads (default: 1, use 0 for CPU cores)
       RUST_LOG: info  # Log level: trace, debug, info, warn, error
+      
+      # Web admin UI (optional). Remove both lines to leave the proxy headless.
+      # Clients send "Authorization: Bearer <token>".
+      NNTP_PROXY_WEB_LISTEN: 0.0.0.0:8080
+      # CHANGE THIS before deploying. If left unset, the proxy generates a
+      # random token at startup and logs it once (search the logs for
+      # "web admin token generated").
+      NNTP_PROXY_WEB_TOKEN: change-me-to-a-long-random-token
       
       # Backend server 0 (required - at least one server must be configured)
       NNTP_SERVER_0_HOST: news.example.com
@@ -53,10 +66,14 @@ services:
           cpus: '1'
           memory: 256M
     
-    # Optional: Mount config file instead of using env vars
-    # If you prefer TOML configuration, uncomment this and comment out NNTP_SERVER_* env vars above
+    # Optional: Mount a config directory instead of using env vars
+    # If you prefer TOML configuration, uncomment this and comment out NNTP_SERVER_* env vars above.
+    # Mount the directory, not the single file, and keep it writable: the web UI
+    # saves config.toml with an atomic rename and writes config.toml.bak beside it,
+    # so a :ro mount (or a single-file bind mount) breaks PUT /api/config.
+    # Put your config.toml inside ./nntp-config first.
     # volumes:
-    #   - ./config.toml:/etc/nntp-proxy/config.toml:ro
+    #   - ./nntp-config:/etc/nntp-proxy:rw
     
     # Optional: Logging configuration
     logging:
@@ -73,9 +90,14 @@ services:
     container_name: nntp-proxy-lb
     ports:
       - "8120:8119"
+      # Optional web admin UI for this instance, loopback-only like the main service.
+      - "127.0.0.1:8081:8080"
     environment:
       NNTP_PROXY_PORT: 8119
       RUST_LOG: info
+      # Optional web admin UI. Disable by removing these lines and the port mapping.
+      NNTP_PROXY_WEB_LISTEN: 0.0.0.0:8080
+      NNTP_PROXY_WEB_TOKEN: ${NNTP_PROXY_WEB_TOKEN:-change-me-to-a-long-random-token}
       
       # -----------------------------------------------------------------------------
       # SECURITY WARNING: Never commit real credentials to version control!

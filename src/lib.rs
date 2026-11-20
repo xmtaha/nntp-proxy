@@ -73,6 +73,7 @@ pub mod protocol;
 mod proxy;
 pub mod stream;
 pub mod tui;
+pub mod web;
 
 // Public modules for integration tests
 pub mod cache;

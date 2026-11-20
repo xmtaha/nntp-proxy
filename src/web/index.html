@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nntp-proxy · Yönetim</title>
+<style>
+/* ---------- tema ---------- */
+:root{color-scheme:dark;--bg:#0d1117;--panel:#151b23;--panel2:#1b232e;--line:#26303c;--text:#d7dee8;--muted:#8b97a7;--accent:#4da3ff;--ok:#3ecf8e;--warn:#f5a623;--err:#ff5d5d}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.hidden{display:none!important}
+.muted{color:var(--muted)}
+h1,h2,h3{margin:0;font-weight:600}
+h2{font-size:18px}
+h3{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:1.2rem 0 .6rem}
+code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--text)}
+button{font:inherit;cursor:pointer;border-radius:7px;border:1px solid var(--line);background:var(--panel2);color:var(--text);padding:.45rem .8rem}
+button:hover{border-color:var(--accent)}
+button:disabled{opacity:.45;cursor:default;border-color:var(--line)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#07121f;font-weight:600}
+button.ghost{background:transparent}
+button.danger{color:var(--err);border-color:#4a2a2e}
+button.mini{padding:.2rem .5rem;font-size:12px;border-radius:5px}
+input,select,textarea{font:inherit;color:var(--text);background:#0f151d;border:1px solid var(--line);border-radius:6px;padding:.4rem .55rem;min-width:0}
+input:focus,select:focus,textarea:focus{outline:1px solid var(--accent);border-color:var(--accent)}
+input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent)}
+/* ---------- giriş ---------- */
+.login{position:fixed;inset:0;display:grid;place-items:center;padding:1rem;background:radial-gradient(1100px 560px at 50% -10%,#16283d 0%,var(--bg) 60%)}
+.login-card{width:min(380px,100%);background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:1.6rem;display:flex;flex-direction:column;gap:.9rem}
+.login-card h1{font-size:22px}
+.err{color:var(--err);min-height:1.2em;margin:0;font-size:13px}
+/* ---------- başlık ---------- */
+header{display:flex;flex-wrap:wrap;gap:.8rem 1rem;align-items:center;padding:.7rem 1.2rem;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10}
+.brand{display:flex;align-items:baseline;gap:.5rem;font-weight:700;font-size:16px}
+.brand .ver{color:var(--muted);font-weight:400;font-size:12px}
+.hdr-meta{display:flex;align-items:center;gap:.6rem;color:var(--muted);font-size:13px}
+.hdr-actions{display:flex;gap:.5rem;align-items:center;margin-left:auto}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--muted);display:inline-block}
+.dot.ok{background:var(--ok);box-shadow:0 0 8px #3ecf8e88}.dot.bad{background:var(--err);box-shadow:0 0 8px #ff5d5d88}
+/* ---------- sekmeler ---------- */
+nav#tabs{display:flex;gap:.25rem;padding:0 1.2rem;background:var(--panel);border-bottom:1px solid var(--line);overflow-x:auto}
+nav#tabs a{padding:.65rem .9rem;color:var(--muted);border-bottom:2px solid transparent;white-space:nowrap;font-size:13px;text-decoration:none}
+nav#tabs a:hover{color:var(--text)}
+nav#tabs a.active{color:var(--text);border-bottom-color:var(--accent)}
+/* ---------- gövde ---------- */
+main{max-width:1280px;margin:0 auto;padding:1.1rem 1.2rem 3rem}
+#banners{display:flex;flex-direction:column;gap:.5rem;margin-bottom:.8rem}
+.banner{display:flex;align-items:center;gap:.8rem;padding:.55rem .8rem;border-radius:8px;border:1px solid var(--line);background:var(--panel);font-size:13px}
+.banner .banner-text{flex:1;overflow-wrap:anywhere}
+.banner.ok{border-color:#1f5c42;background:#10251c}.banner.err{border-color:#5c2328;background:#251012}
+.banner.info{border-color:#1f4560;background:#0f1e2a}
+.row-between{display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+.row{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px}
+/* ---------- KPI / grafik ---------- */
+.kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:.7rem;margin-top:.9rem}
+.kpi{padding:.7rem .8rem;display:flex;flex-direction:column;gap:.15rem}
+.kpi-label{color:var(--muted);font-size:12px}
+.kpi-value{font-size:20px;font-weight:600;font-variant-numeric:tabular-nums}
+.kpi-sub{font-size:11px}.charts{display:grid;grid-template-columns:1fr 1fr;gap:.7rem;margin-top:.9rem}
+.chart-card{padding:.6rem .8rem .8rem}
+.chart-head{display:flex;justify-content:space-between;align-items:baseline;font-size:12px;color:var(--muted);margin-bottom:.35rem}
+.chart-head b{color:var(--text);font-weight:600}
+canvas{width:100%;height:88px;display:block}
+/* ---------- tablolar ---------- */
+.table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--muted);font-weight:500;font-size:12px;background:var(--panel2)}
+tbody tr:last-child td{border-bottom:0}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+tr.empty td{color:var(--muted);text-align:center}
+.pill{display:inline-block;padding:.1rem .45rem;border-radius:999px;font-size:11px;border:1px solid var(--line)}
+.pill.ok{color:var(--ok);border-color:#1f5c42;background:#10251c}
+.pill.bad{color:var(--err);border-color:#5c2328;background:#251012}
+.pill.unk{color:var(--warn);border-color:#5c4a1f;background:#251f10}
+td input{width:100%;min-width:90px}
+td input[type=number]{width:92px}
+td input[type=checkbox]{width:16px;min-width:0}
+/* ---------- formlar ---------- */
+.form-card{padding:.8rem 1rem;margin-bottom:.7rem}
+.form-card h3{margin:0 0 .6rem}
+.form-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:.7rem 1rem}
+.field{display:flex;flex-direction:column;gap:.25rem;font-size:12px;color:var(--muted)}
+.field input,.field select{width:100%}.field small{font-size:11px}
+.check{display:flex;align-items:center;gap:.5rem;font-size:13px;color:var(--text);padding-top:1.15rem}
+.check input{margin:0}.toggle{display:inline-flex;align-items:center;gap:.45rem;font-size:13px;cursor:pointer}
+.pw-wrap{display:flex;gap:.3rem;align-items:center}
+.pw-wrap input{flex:1}
+#raw-json{width:100%;min-height:460px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.5}
+#raw-json[readonly]{color:#a9b6c7}
+@media (max-width:900px){
+  header{padding:.6rem .7rem}
+  nav#tabs{padding:0 .4rem}
+  main{padding:.9rem .7rem 2rem}
+  .charts{grid-template-columns:1fr}
+  .kpis{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+}
+</style>
+</head>
+<body>
+
+<!-- ---------- giriş ekranı ---------- -->
+<div id="login" class="login hidden">
+  <div class="login-card">
+    <h1>nntp-proxy</h1>
+    <p class="muted" style="margin:0">Yönetim arayüzü</p>
+    <label class="field"><span>Yönetim token'ı</span><input id="token" type="password" autocomplete="current-password" placeholder="Bearer token"></label>
+    <button id="btn-login" class="primary" type="button">Giriş</button>
+    <p id="login-err" class="err"></p>
+  </div>
+</div>
+
+<!-- ---------- uygulama ---------- -->
+<div id="app" class="hidden">
+  <header>
+    <div class="brand">nntp-proxy <span class="ver" id="hdr-ver"></span></div>
+    <div class="hdr-meta"><span id="hdr-dot" class="dot" title="Bağlantı durumu"></span><span id="hdr-uptime">—</span></div>
+    <div class="hdr-actions">
+      <button id="btn-save" class="primary" type="button" disabled>Kaydet</button>
+      <button id="btn-logout" class="ghost" type="button">Çıkış</button>
+    </div>
+  </header>
+
+  <nav id="tabs">
+    <a href="#durum" data-tab="durum">Durum</a><a href="#sunucular" data-tab="sunucular">Sunucular</a><a href="#kullanicilar" data-tab="kullanicilar">Kullanıcılar</a><a href="#ayarlar" data-tab="ayarlar">Ayarlar</a><a href="#ham" data-tab="ham">Ham TOML/JSON</a>
+  </nav>
+
+  <main>
+    <div id="banners"></div>
+
+    <!-- Durum -->
+    <section id="tab-durum" class="tab">
+      <div class="row-between"><h2>Durum</h2><span class="muted">Son güncelleme: <span id="last-update">—</span></span></div>
+      <div id="kpis" class="kpis"></div>
+      <div class="charts">
+        <div class="card chart-card">
+          <div class="chart-head"><span>İstemci → backend (bayt/sn)</span><b id="rate-c2b">—</b></div>
+          <canvas id="spark-c2b"></canvas>
+        </div>
+        <div class="card chart-card">
+          <div class="chart-head"><span>Backend → istemci (bayt/sn)</span><b id="rate-b2c">—</b></div>
+          <canvas id="spark-b2c"></canvas>
+        </div>
+      </div>
+      <h3>Backend'ler</h3>
+      <div class="table-wrap"><table id="tbl-backends">
+        <thead><tr><th>Ad</th><th>Durum</th><th class="num">Aktif/Maks</th><th class="num">Komut</th><th class="num">Gönderilen</th><th class="num">Alınan</th><th class="num">4xx</th><th class="num">5xx</th><th class="num">Ort. TTFB</th><th class="num">Bağ. hatası</th></tr></thead>
+        <tbody></tbody></table></div>
+      <h3>Kullanıcılar</h3>
+      <div class="table-wrap"><table id="tbl-users">
+        <thead><tr><th>Kullanıcı</th><th class="num">Aktif/Toplam</th><th class="num">Gönderilen</th><th class="num">Alınan</th><th class="num">Komut</th><th class="num">Hata</th></tr></thead>
+        <tbody></tbody></table></div>
+    </section>
+
+    <!-- Sunucular -->
+    <section id="tab-sunucular" class="tab hidden">
+      <div class="row-between">
+        <div><h2>Sunucular</h2>
+          <p class="muted" style="margin:.3rem 0 0">Parola alanında “***” = değişiklik yok. “sil” parolayı temizler (null).</p></div>
+        <button id="btn-add-server" type="button">Sunucu ekle</button>
+      </div>
+      <div class="table-wrap" style="margin-top:.8rem"><table id="tbl-servers">
+        <thead><tr><th>Ad</th><th>Host</th><th class="num">Port</th><th>Kullanıcı adı</th><th>Parola</th><th class="num">Maks. bağlantı</th><th>TLS</th><th>TLS doğrula</th><th class="num">stat_missing</th><th class="num">Tier (öncelik)</th><th></th></tr></thead>
+        <tbody></tbody></table></div>
+    </section>
+
+    <!-- Kullanıcılar -->
+    <section id="tab-kullanicilar" class="tab hidden">
+      <div class="row-between"><h2>Kullanıcılar</h2><button id="btn-add-user" type="button">Kullanıcı ekle</button></div>
+      <p class="muted" style="margin:.35rem 0 .8rem">Parolalar düz metin TOML'de saklanır.</p>
+      <div class="card form-card"><div class="form-grid">
+        <label class="field"><span>Karşılama mesajı (greeting)</span><input id="greeting" type="text" placeholder="(varsayılan)"></label>
+      </div></div>
+      <div class="table-wrap"><table id="tbl-users-edit">
+        <thead><tr><th>Kullanıcı adı</th><th>Parola</th><th></th></tr></thead>
+        <tbody></tbody></table></div>
+    </section>
+
+    <!-- Ayarlar -->
+    <section id="tab-ayarlar" class="tab hidden">
+      <h2>Ayarlar</h2>
+      <p class="muted" style="margin:.35rem 0 .8rem">Bu formlar yalnızca kendi alanlarını düzenler; diğer anahtarlar olduğu gibi korunur.</p>
+      <div id="ayarlar-form"></div>
+    </section>
+
+    <!-- Ham JSON -->
+    <section id="tab-ham" class="tab hidden">
+      <div class="row-between"><h2>Ham TOML/JSON</h2>
+        <label class="toggle"><input id="raw-edit" type="checkbox"> Ham JSON düzenle</label></div>
+      <p class="muted" style="margin:.35rem 0 .6rem">Yapılandırma dosyası: <code id="cfg-path">—</code>. Formlarda bulunmayan alanlar için kaçış kapısı; düzenleme açıkken kaydetme bu metni kullanır.</p>
+      <textarea id="raw-json" spellcheck="false" readonly></textarea>
+    </section>
+  </main>
+</div>
+
+<script>
+"use strict";
+/* ================= yardımcılar ================= */
+const KEY = "nntp-proxy-token";
+const $ = (id) => document.getElementById(id);
+const SPARK_N = 60;
+
+function el(tag, props, children) {
+  const n = document.createElement(tag);
+  for (const k in props || {}) {
+    const v = props[k];
+    if (k === "class") n.className = v;
+    else if (k === "text") n.textContent = v;
+    else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
+    else if (v === null || v === undefined) continue;
+    else if (k in n) n[k] = v;
+    else n.setAttribute(k, v);
+  }
+  for (const c of [].concat(children === undefined ? [] : children)) {
+    if (c !== null && c !== undefined && c !== false) n.append(c);
+  }
+  return n;
+}
+const td = (x) => el("td", {}, x);
+const tdn = (x) => el("td", { class: "num" }, String(x));
+
+function fmtNum(n) {
+  const v = Number(n);
+  return Number.isFinite(v) ? Math.round(v).toLocaleString("tr-TR") : "0";
+}
+function fmtBytes(n) {
+  let v = Number(n);
+  if (!Number.isFinite(v) || v < 0) v = 0;
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? fmtNum(v) : v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2)) + " " + units[i];
+}
+function fmtDuration(secs) {
+  let s = Math.max(0, Math.floor(Number(secs) || 0));
+  const d = Math.floor(s / 86400); s %= 86400;
+  const h = Math.floor(s / 3600); s %= 3600;
+  const m = Math.floor(s / 60); s %= 60;
+  if (d) return d + "g " + h + "sa";
+  if (h) return h + "sa " + m + "dk";
+  if (m) return m + "dk " + s + "sn";
+  return s + "sn";
+}
+function fmtMs(micros, count) {
+  const c = Number(count);
+  return c > 0 ? (Number(micros) / c / 1000).toFixed(1) + " ms" : "—";
+}
+function setPath(obj, path, value) {
+  const parts = path.split(".");
+  let o = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const k = parts[i];
+    if (typeof o[k] !== "object" || o[k] === null) o[k] = {};
+    o = o[k];
+  }
+  o[parts[parts.length - 1]] = value;
+}
+function tin(type, value, extra) {
+  const n = el("input", Object.assign({ type }, extra || {}));
+  n.value = value === null || value === undefined ? "" : value;
+  return n;
+}
+function binp(type, path, value, extra) {
+  const n = tin(type, type === "checkbox" ? "" : value,
+    Object.assign({ "data-path": path, "data-type": type === "checkbox" ? "bool" : type === "number" ? "num" : "str" }, extra || {}));
+  if (type === "checkbox") n.checked = !!value;
+  return n;
+}
+function select(opts, value, onchange) {
+  const s = el("select", { onchange: (e) => onchange(e.target.value) }, opts.map(([v, l]) => el("option", { value: v, text: l })));
+  s.value = value;
+  if (s.value !== value && value !== null && value !== undefined) {
+    s.append(el("option", { value: String(value), text: String(value) }));
+    s.value = value;
+  }
+  return s;
+}
+function field(label, input, hint) {
+  return el("label", { class: "field" }, [el("span", { text: label }), input, hint ? el("small", { class: "muted", text: hint }) : null]);
+}
+function checkField(label, input) {
+  return el("label", { class: "check" }, [input, el("span", { text: label })]);
+}
+function section(title, children) {
+  return el("div", { class: "card form-card" }, [el("h3", { text: title }), el("div", { class: "form-grid" }, children)]);
+}
+function emptyRow(cols, text) {
+  return el("tr", { class: "empty" }, el("td", { colspan: String(cols), text: text || "Kayıt yok." }));
+}
+function pill(status) {
+  const p = { healthy: ["ok", "sağlıklı"], unhealthy: ["bad", "sağlıksız"] }[status] || ["unk", status || "bilinmiyor"];
+  return el("span", { class: "pill " + p[0], text: p[1] });
+}
+
+/* ================= durum ================= */
+let token = localStorage.getItem(KEY) || "";
+let cfg = null, cfgPath = "", dirty = false, rawMode = false, currentTab = "durum";
+let prevStats = null, prevStatsT = 0, statsBusy = false, lastHealthAt = 0;
+const spark = { c2b: [], b2c: [] };
+const DEFAULTS = {
+  cache: () => ({ article_cache_capacity: 67108864, article_cache_ttl_secs: 86400, store_article_bodies: false, disk: null }),
+  disk: () => ({ path: "/data/cache", capacity: 10737418240, compression: "lz4" }),
+  server: () => ({ name: "", host: "", port: 563, username: null, password: null, max_connections: 10, stat_missing: 0, use_tls: true, tls_verify_cert: true, tier: 0 }),
+};
+
+class ApiError extends Error {
+  constructor(msg, status) { super(msg); this.status = status || 0; }
+}
+async function api(method, path, body) {
+  const headers = {};
+  if (token) headers.Authorization = "Bearer " + token;
+  const opts = { method, headers };
+  if (body !== undefined) { headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+  let res;
+  try { res = await fetch(path, opts); } catch (e) { throw new ApiError("Sunucuya ulaşılamadı.", 0); }
+  const text = await res.text();
+  let data = null;
+  if (text) { try { data = JSON.parse(text); } catch (e) { data = null; } }
+  if (res.status === 401) {
+    logout("Yetkilendirme başarısız (401).");
+    throw new ApiError("Yetkilendirme başarısız (401).", 401);
+  }
+  if (!res.ok) throw new ApiError((data && data.error) || ("HTTP " + res.status), res.status);
+  return data;
+}
+
+/* ================= oturum ================= */
+function setDot(ok) {
+  const d = $("hdr-dot");
+  d.classList.toggle("ok", !!ok);
+  d.classList.toggle("bad", !ok);
+  d.title = ok ? "Son istek başarılı" : "Bağlantı hatası";
+}
+function setVersion(v) { if (v) $("hdr-ver").textContent = "v" + v; }
+function showLogin(msg) {
+  $("app").classList.add("hidden");
+  $("login").classList.remove("hidden");
+  $("login-err").textContent = msg || "";
+}
+function logout(msg) {
+  token = "";
+  localStorage.removeItem(KEY);
+  prevStats = null;
+  prevStatsT = 0;
+  spark.c2b.length = 0;
+  spark.b2c.length = 0;
+  setDirty(false);
+  setDot(false);
+  showLogin(msg === undefined ? "" : msg);
+}
+async function login() {
+  const err = $("login-err");
+  const v = $("token").value.trim();
+  if (!v) { err.textContent = "Token girin."; return; }
+  token = v;
+  err.textContent = "";
+  $("btn-login").disabled = true;
+  try {
+    await loadConfig();
+    localStorage.setItem(KEY, token);
+    enterApp();
+  } catch (e) {
+    token = "";
+    localStorage.removeItem(KEY);
+    err.textContent = e.status === 401 ? "Token geçersiz." : (e.message || "Giriş başarısız.");
+  } finally {
+    $("btn-login").disabled = false;
+  }
+}
+async function boot() {
+  bindStatic();
+  if (!token) { showLogin(""); return; }
+  try { await loadConfig(); enterApp(); }
+  catch (e) {
+    if (e.status === 401) showLogin("Oturum sona erdi. Lütfen tekrar giriş yapın.");
+    else showLogin("Sunucuya ulaşılamadı. Token'ı kontrol edip tekrar deneyin.");
+  }
+}
+function enterApp() {
+  $("login").classList.add("hidden");
+  $("app").classList.remove("hidden");
+  $("token").value = "";
+  clearBanners();
+  showTab(location.hash.slice(1) || "durum");
+  refreshHealth();
+  renderSpark();
+}
+
+/* ================= yapılandırma ================= */
+function normalize() {
+  if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) cfg = {};
+  cfg.proxy = cfg.proxy || {};
+  cfg.routing = cfg.routing || {};
+  cfg.health_check = cfg.health_check || {};
+  cfg.client_auth = cfg.client_auth || {};
+  if (!Array.isArray(cfg.client_auth.users)) cfg.client_auth.users = [];
+  if (!Array.isArray(cfg.servers)) cfg.servers = [];
+  if (!("cache" in cfg)) cfg.cache = null;
+}
+async function loadConfig() {
+  const d = await api("GET", "/api/config");
+  cfg = d.config || {};
+  cfgPath = d.path || "";
+  normalize();
+  $("cfg-path").textContent = cfgPath || "—";
+  renderAyarlar();
+  renderServers();
+  renderKullanicilar();
+  syncRaw();
+  setDirty(false);
+}
+function setDirty(v) { dirty = v; $("btn-save").disabled = !v; }
+function markDirty() { if (!dirty) setDirty(true); }
+
+/* ================= kaydet / yeniden başlat ================= */
+function save() {
+  clearBanners();
+  if (rawMode) {
+    let parsed;
+    try { parsed = JSON.parse($("raw-json").value); }
+    catch (e) { showError("Geçersiz JSON: " + e.message); return; }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) { showError("JSON bir nesne olmalı."); return; }
+    cfg = parsed;
+    normalize();
+  }
+  for (const s of cfg.servers) if (s.password === "") s.password = null;
+  for (const u of cfg.client_auth.users) {
+    if (typeof u.password === "string" && u.password === "") {
+      showError("Kullanıcı için parola girin: " + (u.username || "(adsız)"));
+      return;
+    }
+  }
+  putConfig();
+}
+async function putConfig() {
+  $("btn-save").disabled = true;
+  try {
+    const d = await api("PUT", "/api/config", { config: cfg });
+    setDirty(false);
+    if (d && d.restart_required === false) banner("ok", "Kaydedildi.");
+    else showOk("Kaydedildi. Değişikliklerin uygulanması için yeniden başlatma gerekiyor.");
+    try { await loadConfig(); } catch (e) { if (e.status === 401) return; }
+  } catch (e) {
+    if (e.status === 401) return;
+    setDirty(true);
+    showError(e.message);
+  }
+}
+async function restart() {
+  try { await api("POST", "/api/restart"); }
+  catch (e) { showError(e.message); return; }
+  showInfo("Yeniden başlatılıyor…");
+  const t0 = Date.now();
+  const wait = async () => {
+    if (Date.now() - t0 > 60000) { showError("Yeniden başlatma 60 saniye içinde tamamlanmadı."); return; }
+    try {
+      const res = await fetch("/api/health");
+      if (res.ok) {
+        const h = await res.json();
+        if (h && h.status === "ok") {
+          setVersion(h.version);
+          clearBanners();
+          banner("ok", "Çevrimiçi");
+          setDot(true);
+          prevStats = null;
+          try { await loadConfig(); } catch (e) { if (e.status === 401) return; }
+          refreshHealth();
+          if (currentTab === "durum") refreshStats();
+          return;
+        }
+      }
+    } catch (e) { /* hâlâ kapalı */ }
+    setTimeout(wait, 1000);
+  };
+  setTimeout(wait, 1000);
+}
+
+/* ================= bannerlar ================= */
+function banner(kind, text, actionLabel, action) {
+  const box = el("div", { class: "banner " + kind }, [
+    el("span", { class: "banner-text", text }),
+    actionLabel ? el("button", { class: "mini", type: "button", text: actionLabel, onclick: action }) : null,
+    el("button", { class: "mini ghost", type: "button", text: "×", title: "Kapat", onclick: () => box.remove() }),
+  ]);
+  $("banners").append(box);
+  return box;
+}
+function clearBanners() { $("banners").replaceChildren(); }
+function showError(msg) { clearBanners(); banner("err", msg); }
+function showOk(msg) { clearBanners(); banner("ok", msg, "Yeniden başlat", restart); }
+function showInfo(msg) { clearBanners(); banner("info", msg); }
+
+/* ================= sekmeler ================= */
+const TABS = ["durum", "sunucular", "kullanicilar", "ayarlar", "ham"];
+function showTab(name) {
+  if (TABS.indexOf(name) < 0) name = "durum";
+  currentTab = name;
+  for (const s of document.querySelectorAll(".tab")) s.classList.toggle("hidden", s.id !== "tab-" + name);
+  for (const a of document.querySelectorAll("#tabs a")) a.classList.toggle("active", a.dataset.tab === name);
+  if (name === "durum") { refreshStats(); renderSpark(); }
+  if (name === "ham" && !rawMode) syncRaw();
+}
+
+/* ================= canlı veriler ================= */
+function tick() {
+  if (!token || !cfg) return;
+  if (document.visibilityState !== "visible") return;
+  if (currentTab === "durum") refreshStats();
+  else if (Date.now() - lastHealthAt >= 5000) refreshHealth();
+}
+async function refreshHealth() {
+  if (!token) return;
+  lastHealthAt = Date.now();
+  try {
+    const res = await fetch("/api/health");
+    if (!res.ok) throw new Error("health");
+    const h = await res.json();
+    setVersion(h.version);
+    if (h.uptime_secs !== undefined) $("hdr-uptime").textContent = fmtDuration(h.uptime_secs);
+    setDot(true);
+  } catch (e) { setDot(false); }
+}
+function pushSample(arr, v) { arr.push(v); while (arr.length > SPARK_N) arr.shift(); }
+async function refreshStats() {
+  if (statsBusy || !token) return;
+  statsBusy = true;
+  try {
+    const s = await api("GET", "/api/stats");
+    const now = performance.now();
+    const dt = prevStats ? (now - prevStatsT) / 1000 : 0;
+    if (prevStats && dt > 0.25 && dt < 20) {
+      const m0 = prevStats.metrics || {}, m1 = s.metrics || {};
+      pushSample(spark.c2b, Math.max(0, ((m1.client_to_backend_bytes || 0) - (m0.client_to_backend_bytes || 0)) / dt));
+      pushSample(spark.b2c, Math.max(0, ((m1.backend_to_client_bytes || 0) - (m0.backend_to_client_bytes || 0)) / dt));
+      renderSpark();
+    }
+    prevStats = s;
+    prevStatsT = now;
+    renderStats(s);
+    setDot(true);
+  } catch (e) {
+    if (e.status !== 401) setDot(false);
+  } finally {
+    statsBusy = false;
+  }
+}
+function renderStats(s) {
+  const m = s.metrics || {};
+  const items = [
+    ["Aktif bağlantı", fmtNum(m.active_connections), ""],
+    ["Toplam bağlantı", fmtNum(m.total_connections), ""],
+    ["Durumlu oturum", fmtNum(m.stateful_sessions), ""],
+    ["İstemci → backend", fmtBytes(m.client_to_backend_bytes), ""],
+    ["Backend → istemci", fmtBytes(m.backend_to_client_bytes), ""],
+    ["Önbellek isabet oranı", (Number(m.cache_hit_rate) || 0).toFixed(1) + " %", ""],
+    ["Önbellek boyutu", fmtBytes(m.cache_size_bytes), fmtNum(m.cache_entries) + " girdi"],
+    ["Pipeline komutları", fmtNum(m.pipeline_commands), fmtNum(m.pipeline_batches) + " parti · " + fmtNum(m.in_flight_requests) + " uçuşta"],
+    ["Çalışma süresi", fmtDuration(s.uptime_secs), ""],
+  ];
+  $("kpis").replaceChildren(...items.map((it) => el("div", { class: "card kpi" }, [
+    el("div", { class: "kpi-label", text: it[0] }),
+    el("div", { class: "kpi-value", text: it[1] }),
+    it[2] ? el("div", { class: "kpi-sub muted", text: it[2] }) : null,
+  ])));
+  $("hdr-uptime").textContent = fmtDuration(s.uptime_secs);
+  setVersion(s.version);
+  $("last-update").textContent = new Date().toLocaleTimeString("tr-TR");
+  const bRows = (s.backends || []).map((b) => el("tr", {}, [
+    td(b.name || "#" + b.backend_id), el("td", {}, pill(b.health_status)),
+    tdn(fmtNum(b.active_connections) + " / " + fmtNum(b.max_connections)),
+    tdn(fmtNum(b.total_commands)), tdn(fmtBytes(b.bytes_sent)), tdn(fmtBytes(b.bytes_received)),
+    tdn(fmtNum(b.errors_4xx)), tdn(fmtNum(b.errors_5xx)),
+    tdn(fmtMs(b.ttfb_micros_total, b.ttfb_count)), tdn(fmtNum(b.connection_failures)),
+  ]));
+  $("tbl-backends").querySelector("tbody").replaceChildren(...(bRows.length ? bRows : [emptyRow(10)]));
+  const uRows = (s.users || []).map((u) => el("tr", {}, [
+    td(u.username || "—"), tdn(fmtNum(u.active_connections) + " / " + fmtNum(u.total_connections)),
+    tdn(fmtBytes(u.bytes_sent)), tdn(fmtBytes(u.bytes_received)),
+    tdn(fmtNum(u.total_commands)), tdn(fmtNum(u.errors)),
+  ]));
+  $("tbl-users").querySelector("tbody").replaceChildren(...(uRows.length ? uRows : [emptyRow(6)]));
+}
+
+/* ================= çizim ================= */
+function drawSpark(canvas, data, color) {
+  if (!canvas || !canvas.clientWidth) return;
+  const w = canvas.clientWidth, h = canvas.clientHeight || 88, dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = "#232c38";
+  ctx.lineWidth = 1;
+  for (let i = 1; i <= 3; i++) {
+    const y = Math.round((h * i) / 4) + 0.5;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  if (data.length < 2) return;
+  const max = Math.max.apply(null, data.concat([1]));
+  const xAt = (i) => (i / (SPARK_N - 1)) * w;
+  const yAt = (v) => h - 2 - (v / max) * (h - 6);
+  const off = SPARK_N - data.length;
+  ctx.beginPath();
+  data.forEach((v, i) => { const x = xAt(off + i), y = yAt(v); if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y); });
+  ctx.lineTo(w, h); ctx.lineTo(xAt(off), h); ctx.closePath();
+  ctx.fillStyle = color + "22";
+  ctx.fill();
+  ctx.beginPath();
+  data.forEach((v, i) => { const x = xAt(off + i), y = yAt(v); if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y); });
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+}
+function renderSpark() {
+  drawSpark($("spark-c2b"), spark.c2b, "#4da3ff");
+  drawSpark($("spark-b2c"), spark.b2c, "#3ecf8e");
+  const last = (a) => (a.length ? fmtBytes(a[a.length - 1]) + "/sn" : "—");
+  $("rate-c2b").textContent = last(spark.c2b);
+  $("rate-b2c").textContent = last(spark.b2c);
+}
+
+/* ================= sunucular ================= */
+function serverPw(s) {
+  const inp = tin("password", "", { placeholder: s.password ? "***" : "(yok)", autocomplete: "new-password" });
+  inp.dataset.orig = JSON.stringify(s.password === undefined ? null : s.password);
+  inp.addEventListener("input", () => {
+    s.password = inp.value === "" ? JSON.parse(inp.dataset.orig) : inp.value;
+    markDirty();
+  });
+  const clear = el("button", { type: "button", class: "mini ghost", text: "sil", title: "Parolayı temizle (null)", onclick: () => {
+    s.password = null;
+    inp.dataset.orig = "null";
+    inp.value = "";
+    inp.placeholder = "(yok)";
+    markDirty();
+  } });
+  return el("div", { class: "pw-wrap" }, [inp, clear]);
+}
+function renderServers() {
+  const tb = $("tbl-servers").querySelector("tbody");
+  const rows = cfg.servers.map((s, idx) => el("tr", {}, [
+    td(tin("text", s.name, { placeholder: "ad", oninput: (e) => { s.name = e.target.value; markDirty(); } })),
+    td(tin("text", s.host, { placeholder: "news.example.com", oninput: (e) => { s.host = e.target.value; markDirty(); } })),
+    td(tin("number", s.port, { min: 1, max: 65535, oninput: (e) => { s.port = Number(e.target.value) || 0; markDirty(); } })),
+    td(tin("text", s.username, { placeholder: "(yok)", oninput: (e) => { s.username = e.target.value === "" ? null : e.target.value; markDirty(); } })),
+    td(serverPw(s)),
+    td(tin("number", s.max_connections, { min: 1, oninput: (e) => { s.max_connections = Number(e.target.value) || 1; markDirty(); } })),
+    td(el("input", { type: "checkbox", checked: !!s.use_tls, onchange: (e) => { s.use_tls = e.target.checked; markDirty(); } })),
+    td(el("input", { type: "checkbox", checked: !!s.tls_verify_cert, onchange: (e) => { s.tls_verify_cert = e.target.checked; markDirty(); } })),
+    td(tin("number", s.stat_missing, { min: 0, max: 255, oninput: (e) => { s.stat_missing = Number(e.target.value) || 0; markDirty(); } })),
+    td(tin("number", s.tier, { min: 0, max: 255, oninput: (e) => { s.tier = Number(e.target.value) || 0; markDirty(); } })),
+    td(el("button", { type: "button", class: "mini danger", text: "Kaldır", onclick: () => {
+      if (confirm("Sunucu silinsin mi: " + (s.name || s.host || "(adsız)") + "?")) {
+        cfg.servers.splice(idx, 1);
+        markDirty();
+        renderServers();
+      }
+    } })),
+  ]));
+  tb.replaceChildren(...(rows.length ? rows : [emptyRow(11, "Sunucu yok.")]));
+}
+
+/* ================= kullanıcılar ================= */
+function userPw(u) {
+  const inp = tin("password", "", { placeholder: u.password ? "***" : "yeni parola", autocomplete: "new-password" });
+  inp.dataset.orig = JSON.stringify(u.password === undefined ? "" : u.password);
+  inp.addEventListener("input", () => {
+    u.password = inp.value === "" ? JSON.parse(inp.dataset.orig) : inp.value;
+    markDirty();
+  });
+  return inp;
+}
+function renderKullanicilar() {
+  const ca = cfg.client_auth;
+  $("greeting").value = ca.greeting === null || ca.greeting === undefined ? "" : ca.greeting;
+  const tb = $("tbl-users-edit").querySelector("tbody");
+  const rows = ca.users.map((u, idx) => el("tr", {}, [
+    td(tin("text", u.username, { placeholder: "kullanıcı", oninput: (e) => { u.username = e.target.value; markDirty(); } })),
+    td(userPw(u)),
+    td(el("button", { type: "button", class: "mini danger", text: "Kaldır", onclick: () => {
+      if (confirm("Kullanıcı silinsin mi: " + (u.username || "(adsız)") + "?")) {
+        ca.users.splice(idx, 1);
+        markDirty();
+        renderKullanicilar();
+      }
+    } })),
+  ]));
+  tb.replaceChildren(...(rows.length ? rows : [emptyRow(3, "Kullanıcı yok.")]));
+}
+
+/* ================= ayarlar ================= */
+function renderAyarlar() {
+  const p = cfg.proxy, r = cfg.routing, hc = cfg.health_check, c = cfg.cache;
+  const cacheOn = !!(c && typeof c === "object");
+  const nodes = [];
+  nodes.push(section("Proxy", [
+    field("Dinleme adresi (host)", binp("text", "proxy.host", p.host)),
+    field("Port", binp("number", "proxy.port", p.port, { min: 1, max: 65535 })),
+    field("İş parçacığı (threads)", binp("number", "proxy.threads", p.threads, { min: 0 })),
+    checkField("yEnc doğrulaması", binp("checkbox", "proxy.validate_yenc", p.validate_yenc)),
+  ]));
+  nodes.push(section("Yönlendirme", [
+    field("Mod", select([["stateful", "Durumlu (stateful)"], ["per-command", "Komut başına (per-command)"], ["hybrid", "Hibrit (hybrid)"]],
+      r.mode, (v) => { r.mode = v; markDirty(); })),
+    field("Strateji", select([["weighted-round-robin", "Ağırlıklı round-robin"], ["least-loaded", "En az yüklü (least-loaded)"]],
+      r.strategy, (v) => { r.strategy = v; markDirty(); })),
+    checkField("Uyarlamalı ön kontrol (adaptive precheck)", binp("checkbox", "routing.adaptive_precheck", r.adaptive_precheck)),
+  ]));
+  const cacheNodes = [checkField("Önbellek etkin", el("input", { type: "checkbox", checked: cacheOn, onchange: (e) => {
+    cfg.cache = e.target.checked ? DEFAULTS.cache() : null;
+    markDirty();
+    renderAyarlar();
+  } }))];
+  if (cacheOn) {
+    cacheNodes.push(
+      field("Makale kapasitesi (bayt)", binp("number", "cache.article_cache_capacity", c.article_cache_capacity, { min: 0 }), fmtBytes(c.article_cache_capacity)),
+      field("TTL (saniye)", binp("number", "cache.article_cache_ttl_secs", c.article_cache_ttl_secs, { min: 0 })),
+      checkField("Makale gövdelerini sakla", binp("checkbox", "cache.store_article_bodies", c.store_article_bodies)),
+    );
+    const diskOn = !!(c.disk && typeof c.disk === "object");
+    cacheNodes.push(checkField("Disk önbelleği etkin", el("input", { type: "checkbox", checked: diskOn, onchange: (e) => {
+      c.disk = e.target.checked ? DEFAULTS.disk() : null;
+      markDirty();
+      renderAyarlar();
+    } })));
+    if (diskOn) {
+      cacheNodes.push(
+        field("Disk yolu", binp("text", "cache.disk.path", c.disk.path)),
+        field("Disk kapasitesi (bayt)", binp("number", "cache.disk.capacity", c.disk.capacity, { min: 0 }), fmtBytes(c.disk.capacity)),
+        field("Sıkıştırma", select([["none", "Yok (none)"], ["lz4", "LZ4"], ["zstd", "Zstandard"]], c.disk.compression, (v) => { c.disk.compression = v; markDirty(); })),
+      );
+    }
+  }
+  nodes.push(section("Önbellek", cacheNodes));
+  nodes.push(section("Sağlık kontrolü", [
+    field("Aralık (saniye)", binp("number", "health_check.interval", hc.interval, { min: 1 })),
+    field("Zaman aşımı (saniye)", binp("number", "health_check.timeout", hc.timeout, { min: 1 })),
+    field("Sağlıksız eşiği", binp("number", "health_check.unhealthy_threshold", hc.unhealthy_threshold, { min: 1 })),
+  ]));
+  $("ayarlar-form").replaceChildren(...nodes);
+}
+
+/* ================= ham JSON ================= */
+function syncRaw() {
+  const ta = $("raw-json");
+  ta.value = JSON.stringify(cfg, null, 2);
+  ta.readOnly = !rawMode;
+}
+
+/* ================= olaylar ================= */
+function onFormInput(e) {
+  const t = e.target;
+  const path = t.getAttribute("data-path");
+  if (!path) return;
+  const type = t.getAttribute("data-type");
+  let v;
+  if (type === "bool") v = t.checked;
+  else if (type === "num") {
+    const n = Number(t.value);
+    v = t.value === "" || !Number.isFinite(n) ? 0 : n;
+  } else v = t.value;
+  setPath(cfg, path, v);
+  markDirty();
+}
+function bindStatic() {
+  $("btn-login").addEventListener("click", login);
+  $("token").addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
+  $("btn-logout").addEventListener("click", () => logout());
+  $("btn-save").addEventListener("click", save);
+  $("btn-add-server").addEventListener("click", () => { cfg.servers.push(DEFAULTS.server()); markDirty(); renderServers(); });
+  $("btn-add-user").addEventListener("click", () => {
+    if (!confirm("Yeni kullanıcı eklensin mi?")) return;
+    cfg.client_auth.users.push({ username: "", password: "" });
+    markDirty();
+    renderKullanicilar();
+  });
+  $("greeting").addEventListener("input", (e) => {
+    cfg.client_auth.greeting = e.target.value === "" ? null : e.target.value;
+    markDirty();
+  });
+  $("raw-edit").addEventListener("change", (e) => { rawMode = e.target.checked; syncRaw(); });
+  $("raw-json").addEventListener("input", () => { if (rawMode) markDirty(); });
+  $("ayarlar-form").addEventListener("input", onFormInput);
+  window.addEventListener("hashchange", () => showTab(location.hash.slice(1)));
+  window.addEventListener("resize", renderSpark);
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") tick(); });
+  setInterval(tick, 2000);
+}
+
+boot();
+</script>
+</body>
+</html>

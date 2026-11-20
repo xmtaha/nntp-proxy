@@ -100,10 +100,13 @@ nntp-proxy --config config.toml --tui
 
 Without `--tui`, the server runs headless. The [runtime guide](docs/operator/runtime-and-routing.md) explains how to attach a read-only dashboard from another terminal over loopback.
 
+For a browser UI that also edits the config file, add `--web-listen 127.0.0.1:8080` and open <http://127.0.0.1:8080>. See the [web admin UI guide](docs/operator/web-ui.md).
+
 - [Getting started](docs/operator/getting-started.md)
 - [Configuration](docs/operator/configuration.md): settings, credentials, and environment variables
 - [Operations](docs/operator/operations.md): Docker, persisted files, and troubleshooting
 - [Caching](docs/operator/caching.md)
+- [Web admin UI](docs/operator/web-ui.md): optional HTTP dashboard and config editor
 - [Example configuration](config.example.toml), [full configuration](config.full.toml), and [cache configuration](config.cache.toml)
 - [Changelog](CHANGELOG.md)
 - [Development guide](docs/development.md)

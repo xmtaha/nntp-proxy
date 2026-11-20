@@ -96,6 +96,18 @@ async fn run_proxy(
 
     let listener = runtime::bind_listener(&launch.host, launch.port, launch.routing_mode).await?;
 
+    if let Some(listen) = args.common.web_listen {
+        nntp_proxy::web::spawn_server(
+            nntp_proxy::web::WebConfig {
+                listen,
+                token: nntp_proxy::web::resolve_token(),
+            },
+            proxy.clone(),
+            PathBuf::from(args.common.config.as_str()),
+            shutdown_tx.clone(),
+        );
+    }
+
     runtime::spawn_stats_flusher(proxy.connection_stats());
     runtime::spawn_cache_stats_logger(&proxy);
     runtime::spawn_metrics_saver(
@@ -408,6 +420,7 @@ mod tests {
             headless: false,
             tui_listen: None,
             tui_attach: None,
+            web_listen: None,
             port: None,
             host: None,
             routing_mode: Some(nntp_proxy::RoutingMode::Stateful),

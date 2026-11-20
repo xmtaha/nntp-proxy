@@ -80,7 +80,8 @@ restart without `NNTP_PROXY_WEB_TOKEN` produces a new one.
 | Routing | `[routing].mode` and `[routing].backend_selection` |
 | Cache | `[cache]` and `[cache.disk]` |
 | Health checks | `[health_check]` |
-| Live stats | Read-only counters via `GET /api/stats` |
+| Live stats | Read-only: the same dashboard the TUI renders, via `GET /api/stats` |
+| Logs | Read-only: recent log lines via `GET /api/logs` |
 
 Password values are returned as `"***"` by `GET /api/config` and restored
 server-side on `PUT /api/config`, so saving an unchanged form keeps the stored
@@ -145,7 +146,8 @@ directory owned by another user makes `PUT /api/config` fail.
 | --- | --- | --- | --- |
 | `GET` | `/` | none | Static UI |
 | `GET` | `/api/health` | none | Health probe for containers and load balancers |
-| `GET` | `/api/stats` | bearer | Live stats as JSON |
+| `GET` | `/api/stats` | bearer | Live dashboard JSON (same data as the TUI) |
+| `GET` | `/api/logs` | bearer | Recent in-memory log lines |
 | `GET` | `/api/config` | bearer | `{"config": ..., "path": ...}` with passwords redacted |
 | `PUT` | `/api/config` | bearer | Validate and save the config file, then write the backup |
 | `POST` | `/api/restart` | bearer | Graceful shutdown; restart is up to the supervisor |
@@ -154,11 +156,38 @@ The API exchanges JSON. Passwords sent back as `"***"` keep their stored
 value. `PUT /api/config` accepts either the `{"config": ...}` envelope that
 `GET` returns or a bare config object.
 
+### `GET /api/stats`
+
+The payload is the terminal dashboard's own state, sampled every 250 ms in the
+proxy process, so the browser cannot drift from the TUI:
+
+| Field | Contents |
+| --- | --- |
+| `metrics` | Connections, stateful sessions, cache hit rate/size, pipeline counters, in-flight requests |
+| `backend_views` | Per backend: `server{name,host,port,max_connections}`, `stats`, `active_connections`, `health_status`, `pending_count`, `load_ratio`, `stateful_count`, `traffic_share`, `history` |
+| `top_users` | Per client: connections, bytes, per-second rates, commands, errors |
+| `client_history` | 60 throughput points (250 ms apart) for the client-facing graphs |
+| `system_stats` | Process CPU and memory with peaks |
+| `buffer_pool` | Scratch buffer pool: `available`, `in_use`, `total` |
+| `uptime_secs`, `version`, `routing_mode`, `sample_interval_ms` | Process context |
+
+Byte counters are objects, `{"bytes": 12345}`. Both history arrays always have
+60 entries; points the proxy has not sampled yet are `null`, so a freshly
+started process returns a partly empty graph that fills in on its own.
+
+### `GET /api/logs?lines=N`
+
+Returns `{"enabled": true, "lines": [{"text": "..."}]}`. `N` defaults to 200 and
+is clamped to 1..2000. In-memory log capture is only enabled for a headless
+process started with `--web-listen` or `--tui-listen`; otherwise the endpoint
+answers `{"enabled": false, "lines": []}`.
+
 ```bash
 TOKEN="$(openssl rand -hex 32)"   # or the value you set
 
 curl http://127.0.0.1:8080/api/health
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/stats
+curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8080/api/logs?lines=100"
 curl -H "Authorization: Bearer $TOKEN" \
   -o config.current.json http://127.0.0.1:8080/api/config
 curl -X PUT -H "Authorization: Bearer $TOKEN" \

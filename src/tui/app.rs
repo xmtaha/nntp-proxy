@@ -1,6 +1,6 @@
 //! TUI application state and logic
 
-use crate::config::Server;
+use crate::config::{RoutingMode, Server};
 use crate::metrics::{MetricsCollector, MetricsSnapshot};
 use crate::metrics::{PendingRequests, StatefulSessions};
 use crate::router::BackendSelector;
@@ -349,6 +349,7 @@ impl TuiAppBuilder {
             log_buffer: Arc::new(self.log_buffer.unwrap_or_default()),
             view_mode: ViewMode::default(),
             show_details: false,
+            routing_mode: RoutingMode::default(),
             system_monitor: SystemMonitor::new(),
             system_stats: crate::tui::SystemStats::default(),
         }
@@ -387,6 +388,8 @@ pub struct TuiApp {
     view_mode: ViewMode,
     /// Show detailed metrics (timing breakdown, etc.)
     show_details: bool,
+    /// Routing mode the proxy runs with; a CLI override never reaches the config snapshot.
+    routing_mode: RoutingMode,
     /// System resource monitor
     system_monitor: crate::tui::SystemMonitor,
     /// Current system stats (CPU and memory)
@@ -715,6 +718,17 @@ impl TuiApp {
     #[must_use]
     pub const fn log_buffer(&self) -> &Arc<LogBuffer> {
         &self.log_buffer
+    }
+
+    /// Routing mode the proxy runs with; a CLI override never reaches the config snapshot.
+    #[must_use]
+    pub const fn routing_mode(&self) -> RoutingMode {
+        self.routing_mode
+    }
+
+    /// Override the routing mode reported alongside the dashboard.
+    pub const fn set_routing_mode(&mut self, routing_mode: RoutingMode) {
+        self.routing_mode = routing_mode;
     }
 
     /// Get current view mode

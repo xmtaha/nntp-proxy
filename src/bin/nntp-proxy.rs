@@ -22,8 +22,8 @@ fn main() -> Result<()> {
     let args = Args::parse();
     args.common.validate_runtime_mode()?;
     let ui_mode = args.common.effective_ui_mode();
-    let capture_headless_tui_buffer =
-        ui_mode == UiMode::Headless && args.common.tui_listen.is_some();
+    let capture_headless_tui_buffer = ui_mode == UiMode::Headless
+        && (args.common.tui_listen.is_some() || args.common.web_listen.is_some());
 
     if ui_mode == UiMode::Tui
         && let Some(connect_addr) = args.common.tui_attach
@@ -101,9 +101,11 @@ async fn run_proxy(
             nntp_proxy::web::WebConfig {
                 listen,
                 token: nntp_proxy::web::resolve_token(),
+                routing_mode: launch.routing_mode,
             },
             proxy.clone(),
             PathBuf::from(args.common.config.as_str()),
+            log_buffer.clone(),
             shutdown_tx.clone(),
         );
     }

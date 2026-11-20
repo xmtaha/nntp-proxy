@@ -42,3 +42,6 @@ massif.out.*
 /release/
 .env
 DEEP_DIVE_ANALYSIS.md
+
+# codegraph index
+.codegraph/

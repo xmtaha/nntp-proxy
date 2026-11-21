@@ -11,7 +11,9 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY rust-toolchain.toml ./
-RUN rustup toolchain install "$(sed -n 's/^channel = \"\\(.*\\)\"/\\1/p' rust-toolchain.toml)"
+# rustup reads the pin from rust-toolchain.toml; parsing it here broke the
+# build because the quoting differs between shells.
+RUN rustup toolchain install
 
 # Copy everything and build
 COPY Cargo.toml Cargo.lock ./

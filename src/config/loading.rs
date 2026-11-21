@@ -1265,7 +1265,7 @@ adaptive_precheck = true
         let migrated = std::fs::read_to_string(&path).unwrap();
         assert!(migrated.contains("[routing]"));
         assert!(migrated.contains("mode = \"per-command\""));
-        assert!(migrated.contains("backend_selection = \"least-loaded\""));
+        assert!(migrated.contains("strategy = \"least-loaded\""));
         assert!(migrated.contains("adaptive_precheck = true"));
     }
 

@@ -369,7 +369,17 @@ async fn write_config(
     }
     let config: Config = match serde_json::from_value(incoming) {
         Ok(config) => config,
-        Err(error) => return bad_request(&format!("configuration is not valid: {error}")),
+        Err(error) => {
+            let message = error.to_string();
+            // A JSON object can hold two spellings of one aliased key that TOML
+            // would have rejected; say which one to drop instead of echoing serde.
+            let hint = if message.contains("duplicate field") {
+                " (the same setting appears twice: keep routing.strategy, drop the other spelling)"
+            } else {
+                ""
+            };
+            return bad_request(&format!("configuration is not valid: {message}{hint}"));
+        }
     };
     if let Err(error) = config.validate() {
         return bad_request(&format!("validation failed: {error:#}"));

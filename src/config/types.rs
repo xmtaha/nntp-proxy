@@ -208,7 +208,9 @@ pub struct Routing {
     #[serde(rename = "mode", alias = "routing_mode")]
     pub routing_mode: RoutingMode,
     /// Backend selection strategy for load balancing
-    #[serde(alias = "strategy")]
+    // The alias shares a field with serde's own name, so a config that carries
+    // both keys is a duplicate-field error. Our serializer writes only `strategy`.
+    #[serde(rename = "strategy", alias = "backend_selection")]
     pub backend_selection: BackendSelectionStrategy,
     /// Enable adaptive availability prechecking for STAT/HEAD commands (default: false)
     #[serde(default = "super::defaults::adaptive_precheck")]

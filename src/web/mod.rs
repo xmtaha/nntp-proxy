@@ -326,8 +326,21 @@ async fn read_config(State(state): State<Arc<WebState>>, headers: HeaderMap) -> 
             "path": state.config_path.display().to_string(),
         }))
         .into_response(),
+        Err(error) if config_file_missing(&state.config_path) => Json(json!({
+            "config": null,
+            "path": state.config_path.display().to_string(),
+            "editable": false,
+            "error": format!("{error:#}"),
+        }))
+        .into_response(),
         Err(error) => server_error(&error),
     }
+}
+
+/// A file-backed config that does not exist yet is not a server fault: the
+/// proxy is running from env vars, so the editor can report why saving is off.
+fn config_file_missing(path: &std::path::Path) -> bool {
+    !path.exists()
 }
 
 async fn write_config(
@@ -343,6 +356,12 @@ async fn write_config(
     let mut incoming = body.get("config").cloned().unwrap_or(body);
     let current = match load_config(state.config_path.to_string_lossy().as_ref()) {
         Ok(config) => config,
+        Err(_) if config_file_missing(&state.config_path) => {
+            let path = state.config_path.display();
+            return bad_request(&format!(
+                "config file '{path}' does not exist; mount it into the container before saving"
+            ));
+        }
         Err(error) => return server_error(&error),
     };
     if let Err(error) = restore_secrets(&mut incoming, &current) {

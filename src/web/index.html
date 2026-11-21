@@ -400,7 +400,7 @@ function loadClass(r) {
 
 /* ================= durum ================= */
 let token = localStorage.getItem(KEY) || "";
-let cfg = null, cfgPath = "", dirty = false, rawMode = false, currentTab = "durum";
+let cfg = null, cfgPath = "", dirty = false, rawMode = false, editable = false, currentTab = "durum";
 let statsBusy = false, healthBusy = false, logBusy = false;
 let lastStatsAt = 0, lastHealthAt = 0, lastLogAt = 0;
 const sysHist = { cpu: [], mem: [] };
@@ -510,13 +510,24 @@ async function loadConfig() {
   cfgPath = d.path || "";
   normalize();
   $("cfg-path").textContent = cfgPath || "—";
+  // GET reports editable:false when the config file is missing; an older
+  // server that errors outright leaves cfg empty, which normalizes to no servers.
+  editable = d.editable !== false && cfg.servers.length > 0;
+  $("btn-save").disabled = true;
+  if (!editable) {
+    showError(
+      "Yapılandırma dosyası yok: " + (d.error || cfgPath) +
+        " — proxy ortam değişkenleriyle çalışıyor. Kaydetmek için dosyayı konteynere bağla:" +
+        " ./nntp-config:/etc/nntp-proxy:rw (docker-compose.yml)",
+    );
+  }
   renderAyarlar();
   renderServers();
   renderKullanicilar();
   syncRaw();
   setDirty(false);
 }
-function setDirty(v) { dirty = v; $("btn-save").disabled = !v; }
+function setDirty(v) { dirty = v && editable; $("btn-save").disabled = !dirty; }
 function markDirty() { if (!dirty) setDirty(true); }
 
 /* ================= kaydet / yeniden başlat ================= */

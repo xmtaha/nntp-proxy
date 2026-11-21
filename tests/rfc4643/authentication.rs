@@ -370,8 +370,10 @@ fn test_config_client_auth_enabled_state() {
                 users: vec![UserCredentials {
                     username: "user".to_string(),
                     password: "pass".to_string(),
+                    max_connections: None,
                 }],
                 greeting: None,
+                max_connections_per_user: None,
             },
             true,
         ),
@@ -379,6 +381,7 @@ fn test_config_client_auth_enabled_state() {
             ClientAuth {
                 users: vec![],
                 greeting: None,
+                max_connections_per_user: None,
             },
             false,
         ),

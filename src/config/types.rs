@@ -3,6 +3,7 @@
 //! This module contains all the core configuration structures used by the proxy.
 
 use super::defaults;
+use crate::types::config::UserConnectionLimit;
 use crate::types::{
     CacheCapacity, HostName, MaxConnections, MaxErrors, Port, QueuePressurePercent, ServerName,
     ThreadCount, duration_serde, option_duration_serde,
@@ -562,6 +563,10 @@ pub struct ClientAuth {
     /// List of authorized users for client authentication
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub users: Vec<UserCredentials>,
+    /// Default simultaneous connection limit for users that set none; absent
+    /// means no limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_connections_per_user: Option<UserConnectionLimit>,
 }
 
 /// Individual user credentials
@@ -571,6 +576,10 @@ pub struct UserCredentials {
     pub username: String,
     /// Password paired with [`Self::username`].
     pub password: String,
+    /// Simultaneous connection limit for this user; falls back to
+    /// [`ClientAuth::max_connections_per_user`] when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<UserConnectionLimit>,
 }
 
 impl ClientAuth {
@@ -586,6 +595,28 @@ impl ClientAuth {
         self.users
             .iter()
             .map(|user| (user.username.as_str(), user.password.as_str()))
+            .collect()
+    }
+
+    /// Simultaneous connection limit for one user, if any applies.
+    #[must_use]
+    pub fn connection_limit(&self, username: &str) -> Option<UserConnectionLimit> {
+        self.users
+            .iter()
+            .find(|user| user.username == username)
+            .and_then(|user| user.max_connections)
+            .or(self.max_connections_per_user)
+    }
+
+    /// [`Self::connection_limit`] keyed by username, for the runtime gate.
+    #[must_use]
+    pub fn connection_limits(&self) -> std::collections::HashMap<String, UserConnectionLimit> {
+        self.users
+            .iter()
+            .filter_map(|user| {
+                self.connection_limit(&user.username)
+                    .map(|limit| (user.username.clone(), limit))
+            })
             .collect()
     }
 }
@@ -1104,6 +1135,7 @@ mod tests {
         auth.users.push(UserCredentials {
             username: "user".to_string(),
             password: "pass".to_string(),
+            max_connections: None,
         });
         assert!(auth.is_enabled());
     }
@@ -1114,6 +1146,7 @@ mod tests {
         auth.users.push(UserCredentials {
             username: "alice".to_string(),
             password: "secret".to_string(),
+            max_connections: None,
         });
         assert!(auth.is_enabled());
     }
@@ -1124,6 +1157,7 @@ mod tests {
         auth.users.push(UserCredentials {
             username: "user".to_string(),
             password: "pass".to_string(),
+            max_connections: None,
         });
 
         let users = auth.all_users();
@@ -1137,10 +1171,12 @@ mod tests {
         auth.users.push(UserCredentials {
             username: "alice".to_string(),
             password: "alice_pw".to_string(),
+            max_connections: None,
         });
         auth.users.push(UserCredentials {
             username: "bob".to_string(),
             password: "bob_pw".to_string(),
+            max_connections: None,
         });
 
         let users = auth.all_users();

@@ -114,11 +114,26 @@ Client auth is optional and applies to the proxy itself, not the backend servers
 ```toml
 [client_auth]
 greeting = "200 NNTP proxy ready"
+# Applies to users that set no limit of their own.
+max_connections_per_user = 8
 
 [[client_auth.users]]
 username = "reader"
 password = "reader-password"
+# Simultaneous connections for this user; overrides the default above.
+max_connections = 4
 ```
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `greeting` | unset | Optional banner line sent on connect |
+| `max_connections_per_user` | unset (unlimited) | Default simultaneous connections per user |
+| `users[].max_connections` | unset (falls back to the default) | Simultaneous connections for one user |
+
+A user's connections count once the session has authenticated and sends its
+first command; a session that cannot get a slot within a minute is closed with
+`502 Too many connections for this user`. The limit governs client sessions, not
+backend pool size: it only bounds what one user can open through the proxy.
 
 ### `[[servers]]`
 

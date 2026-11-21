@@ -187,7 +187,7 @@ td input[type=checkbox]{width:16px;min-width:0}
 
       <h3>Kullanıcılar</h3>
       <div class="table-wrap"><table id="tbl-users">
-        <thead><tr><th scope="col">Kullanıcı</th><th scope="col" class="num">Aktif/Toplam</th><th scope="col" class="num">Gönderilen</th>
+        <thead><tr><th scope="col">Kullanıcı</th><th scope="col" class="num">Aktif</th><th scope="col" class="num">Limit</th><th scope="col" class="num">Toplam</th><th scope="col" class="num">Gönderilen</th>
           <th scope="col" class="num">Alınan</th><th scope="col" class="num">Giden hız</th><th scope="col" class="num">Gelen hız</th>
           <th scope="col" class="num">Komut</th><th scope="col" class="num">Hata</th></tr></thead>
         <tbody></tbody></table></div>
@@ -245,9 +245,10 @@ td input[type=checkbox]{width:16px;min-width:0}
       <p class="muted" style="margin:.35rem 0 .8rem">Parolalar düz metin TOML'de saklanır.</p>
       <div class="card form-card"><div class="form-grid">
         <label class="field"><span>Karşılama mesajı (greeting)</span><input id="greeting" type="text" placeholder="(varsayılan)"></label>
+        <label class="field"><span>Kullanıcı başına varsayılan maks. bağlantı</span><input id="max-per-user" type="number" min="1" placeholder="sınırsız"></label>
       </div></div>
       <div class="table-wrap"><table id="tbl-users-edit">
-        <thead><tr><th scope="col">Kullanıcı adı</th><th scope="col">Parola</th><th scope="col"><span class="hidden">işlem</span></th></tr></thead>
+        <thead><tr><th scope="col">Kullanıcı adı</th><th scope="col">Parola</th><th scope="col" class="num">Maks. bağlantı</th><th scope="col"><span class="hidden">işlem</span></th></tr></thead>
         <tbody></tbody></table></div>
     </section>
 
@@ -757,7 +758,9 @@ function renderStats(s) {
   const users = Array.isArray(s.top_users) ? s.top_users : [];
   const uRows = users.map((u) => el("tr", {}, [
     td(u.username || "—"),
-    tdn(fmtNum(u.active_connections) + " / " + fmtNum(u.total_connections)),
+    tdn(fmtNum(u.active_connections)),
+    tdn(limitText(u.max_connections, u.active_connections, u.open_connections)),
+    tdn(fmtNum(u.total_connections)),
     tdn(fmtBytes(u.bytes_sent)),
     tdn(fmtBytes(u.bytes_received)),
     tdn(fmtRate(u.bytes_sent_per_sec)),
@@ -765,7 +768,12 @@ function renderStats(s) {
     tdn(fmtNum(u.total_commands)),
     tdn(fmtNum(u.errors)),
   ]));
-  $("tbl-users").querySelector("tbody").replaceChildren(...(uRows.length ? uRows : [emptyRow(8)]));
+  $("tbl-users").querySelector("tbody").replaceChildren(...(uRows.length ? uRows : [emptyRow(10)]));
+}
+function limitText(max, active, open) {
+  if (!Number.isFinite(Number(max)) || Number(max) <= 0) return "sınırsız";
+  const used = Number(open !== undefined && open !== null ? open : active) || 0;
+  return used + " / " + Number(max);
 }
 function lastOf(arr, key) {
   for (let i = arr.length - 1; i >= 0; i--) {
@@ -983,10 +991,17 @@ function userPw(u) {
 function renderKullanicilar() {
   const ca = cfg.client_auth;
   $("greeting").value = ca.greeting === null || ca.greeting === undefined ? "" : ca.greeting;
+  const perUser = ca.max_connections_per_user;
+  $("max-per-user").value = perUser === null || perUser === undefined ? "" : perUser;
   const tb = $("tbl-users-edit").querySelector("tbody");
   const rows = ca.users.map((u, idx) => el("tr", {}, [
     td(tin("text", u.username, { placeholder: "kullanıcı", "aria-label": "Kullanıcı adı", oninput: (e) => { u.username = e.target.value; markDirty(); } })),
     td(userPw(u)),
+    td(tin("number", u.max_connections === null || u.max_connections === undefined ? "" : u.max_connections, { min: 1, placeholder: "sınırsız", "aria-label": "Kullanıcının maksimum bağlantısı", oninput: (e) => {
+      const v = e.target.value.trim();
+      u.max_connections = v === "" ? null : (Number(v) || null);
+      markDirty();
+    } })),
     td(el("button", { type: "button", class: "mini danger", text: "Kaldır", onclick: () => {
       if (confirm("Kullanıcı silinsin mi: " + (u.username || "(adsız)") + "?")) {
         ca.users.splice(idx, 1);
@@ -995,7 +1010,7 @@ function renderKullanicilar() {
       }
     } })),
   ]));
-  tb.replaceChildren(...(rows.length ? rows : [emptyRow(3, "Kullanıcı yok.")]));
+  tb.replaceChildren(...(rows.length ? rows : [emptyRow(4, "Kullanıcı yok.")]));
 }
 
 /* ================= ayarlar ================= */
@@ -1087,12 +1102,17 @@ function bindStatic() {
   $("btn-add-user").addEventListener("click", () => {
     if (!cfg) return;
     if (!confirm("Yeni kullanıcı eklensin mi?")) return;
-    cfg.client_auth.users.push({ username: "", password: "" });
+    cfg.client_auth.users.push({ username: "", password: "", max_connections: null });
     markDirty();
     renderKullanicilar();
   });
   $("greeting").addEventListener("input", (e) => {
     cfg.client_auth.greeting = e.target.value === "" ? null : e.target.value;
+    markDirty();
+  });
+  $("max-per-user").addEventListener("input", (e) => {
+    const v = e.target.value.trim();
+    cfg.client_auth.max_connections_per_user = v === "" ? null : (Number(v) || null);
     markDirty();
   });
   $("raw-edit").addEventListener("change", (e) => { rawMode = e.target.checked; syncRaw(); });

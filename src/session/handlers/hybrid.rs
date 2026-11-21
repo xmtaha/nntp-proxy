@@ -29,6 +29,14 @@ mod error {
     pub const BACKEND_NOT_FOUND: &str = "Backend not found";
 }
 
+use crate::session::handlers::stateful::{SessionUserGate, StatefulLoopContext};
+
+/// Connection accounting and the user gate handed to the stateful loop.
+pub(in crate::session) struct StatefulHandoffGate<'a> {
+    pub connection_guard: &'a crate::proxy::ClientConnectionGuard<'a>,
+    pub user_gate: crate::proxy::UserGateEntry,
+}
+
 /// The dedicated backend resources held from hybrid handoff through loop exit.
 ///
 /// Keeping the connection, selected backend, and pending-command accounting
@@ -163,10 +171,11 @@ impl ClientSession {
         initial_request: crate::command::StatefulHandoff,
         client_to_backend_bytes: u64,
         backend_to_client_bytes: u64,
+        user_gate: StatefulHandoffGate<'_>,
     ) -> Result<TransferMetrics, crate::session::SessionError>
     where
-        R: tokio::io::AsyncRead + Unpin,
-        W: tokio::io::AsyncWrite + Unpin,
+        R: tokio::io::AsyncRead + Unpin + Send,
+        W: tokio::io::AsyncWrite + Unpin + Send,
     {
         let mut backend = self
             .acquire_stateful_backend()
@@ -204,6 +213,16 @@ impl ClientSession {
             self.auth_handler.is_enabled(),
         );
         state.mark_backend_request_sent(initial_request.request().kind());
+        // The per-command loop already admitted this session; the stateful loop
+        // must not pay for a second slot of the same user.
+        if let Some(username) = self
+            .username()
+            .and_then(|name| crate::types::Username::try_new(name.to_owned()).ok())
+        {
+            state.mark_authenticated();
+            state.auth_username =
+                crate::session::auth_state::ClientAuthState::Authenticated(username);
+        }
 
         match self.mode_state.switch_to_stateful() {
             crate::session::ModeTransition::Switched => {}
@@ -224,16 +243,19 @@ impl ClientSession {
         let (backend_read, backend_write) = tokio::io::split(backend.connection_mut().stream_mut());
 
         // Delegate to stateful loop (handles all remaining commands + responses)
-        let result = self
-            .run_stateful_proxy_loop(
-                client_reader,
-                client_write,
-                backend_read,
-                backend_write,
-                state,
+        let result = ClientSession::run_stateful_proxy_loop(
+            StatefulLoopContext {
+                session: self,
                 backend_id,
-            )
-            .await;
+                user_gate: SessionUserGate::new(user_gate.connection_guard, user_gate.user_gate),
+            },
+            client_reader,
+            client_write,
+            backend_read,
+            backend_write,
+            state,
+        )
+        .await;
 
         // pending_guard automatically calls complete_command via Drop
 
@@ -298,6 +320,7 @@ mod tests {
     use crate::pool::{BufferPool, DeadpoolConnectionProvider};
     use crate::protocol::RequestContext;
     use crate::router::BackendSelector;
+    use crate::session::handlers::hybrid::StatefulHandoffGate;
     use crate::session::{ClientSession, SessionMode};
     use crate::types::{BufferSize, ClientAddress, ServerName};
     use proptest::prelude::*;
@@ -388,6 +411,7 @@ mod tests {
         )
         .expect("GROUP starts a hybrid stateful handoff");
         let (client_write, client_read) = tokio::io::duplex(64);
+        let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
 
         let result = session
             .switch_to_stateful_mode(
@@ -396,6 +420,10 @@ mod tests {
                 stateful_request,
                 0,
                 0,
+                StatefulHandoffGate {
+                    connection_guard: &connection_guard,
+                    user_gate: crate::proxy::UserGateEntry::Unmetered,
+                },
             )
             .await;
 
@@ -430,6 +458,7 @@ mod tests {
                     let port = listener.local_addr().unwrap().port();
                     let router = test_router(port, 1);
                     let mut session = test_hybrid_session(router);
+                    let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
                     let backend = tokio::spawn(async move {
                         let (stream, _) = listener.accept().await.unwrap();
                         let (read, mut write) = tokio::io::split(stream);
@@ -464,6 +493,7 @@ mod tests {
                             handoff,
                             0,
                             0,
+                                        StatefulHandoffGate { connection_guard: &connection_guard, user_gate: crate::proxy::UserGateEntry::Unmetered },
                         ).await
                     });
 
@@ -580,12 +610,23 @@ mod tests {
 
         let router = test_router(port, 1);
         let mut first_session = test_hybrid_session(Arc::clone(&router));
+        let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
         let (client, proxy_client) = tokio::io::duplex(64);
         drop(client);
         let (proxy_read, proxy_write) = tokio::io::split(proxy_client);
         let first = tokio::spawn(async move {
             first_session
-                .switch_to_stateful_mode(BufReader::new(proxy_read), proxy_write, old_handoff, 0, 0)
+                .switch_to_stateful_mode(
+                    BufReader::new(proxy_read),
+                    proxy_write,
+                    old_handoff,
+                    0,
+                    0,
+                    StatefulHandoffGate {
+                        connection_guard: &connection_guard,
+                        user_gate: crate::proxy::UserGateEntry::Unmetered,
+                    },
+                )
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(5), first_seen_rx)
@@ -604,11 +645,22 @@ mod tests {
             .unwrap();
 
         let mut second_session = test_hybrid_session(router);
+        let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
         let (mut client, proxy_client) = tokio::io::duplex(4096);
         let (proxy_read, proxy_write) = tokio::io::split(proxy_client);
         let second = tokio::spawn(async move {
             second_session
-                .switch_to_stateful_mode(BufReader::new(proxy_read), proxy_write, new_handoff, 0, 0)
+                .switch_to_stateful_mode(
+                    BufReader::new(proxy_read),
+                    proxy_write,
+                    new_handoff,
+                    0,
+                    0,
+                    StatefulHandoffGate {
+                        connection_guard: &connection_guard,
+                        user_gate: crate::proxy::UserGateEntry::Unmetered,
+                    },
+                )
                 .await
         });
         let mut actual = vec![0; expected_second_response.len()];

@@ -207,8 +207,10 @@ fn test_config_auth_round_trip() {
             users: vec![UserCredentials {
                 username: "testuser".to_string(),
                 password: "testpass".to_string(),
+                max_connections: None,
             }],
             greeting: Some("Custom Auth Required".to_string()),
+            max_connections_per_user: None,
         },
     };
 

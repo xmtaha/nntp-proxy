@@ -1,9 +1,12 @@
 //! Client authentication handling
 
 use crate::command::AuthAction;
-use crate::protocol::{AUTH_ACCEPTED, AUTH_FAILED, AUTH_OUT_OF_SEQUENCE, AUTH_REQUIRED};
+use crate::protocol::{
+    AUTH_ACCEPTED, AUTH_FAILED, AUTH_OUT_OF_SEQUENCE, AUTH_REQUIRED, AUTH_TOO_MANY_CONNECTIONS,
+};
 use crate::types::{Password, Username, ValidationError};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
 /// A password held as bytes with redacted formatting.
@@ -52,16 +55,92 @@ impl std::fmt::Debug for Credentials {
     }
 }
 
+/// A limit on one user's simultaneous client connections (count of open
+/// sessions).
+pub type UserConnectionLimit = crate::types::config::UserConnectionLimit;
+
+/// Admission of one client session against its user's limit.
+///
+/// Dropping a [`UserSlot::Held`] gives the connection back, so an aborted or
+/// panicking session can never strand a user's limit.
+#[derive(Debug, Clone)]
+pub enum UserSlot {
+    /// The session does not hold a user towards a limit (no limit, or not yet
+    /// authenticated).
+    Unmetered,
+    /// The session holds one of the user's connections until it drops.
+    Held {
+        username: Username,
+        open: Arc<std::sync::Mutex<HashMap<Username, usize>>>,
+        /// Fired when this slot returns to the pool.
+        slot_released: Arc<tokio::sync::Notify>,
+    },
+}
+
+impl UserSlot {
+    /// Whether this slot counts towards a user's limit.
+    #[must_use]
+    pub const fn is_metered(&self) -> bool {
+        matches!(self, Self::Held { .. })
+    }
+
+    /// The user whose limit this slot counts towards.
+    #[must_use]
+    pub fn username(&self) -> &str {
+        match self {
+            Self::Unmetered => "",
+            Self::Held { username, .. } => username.as_ref(),
+        }
+    }
+
+    /// Give the slot to a waiting session without releasing it.
+    pub fn hand_over(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for UserSlot {
+    fn drop(&mut self) {
+        let Self::Held {
+            username,
+            open,
+            slot_released,
+        } = self
+        else {
+            return;
+        };
+        {
+            let mut counts = open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(in_use) = counts.get_mut(username) {
+                *in_use = in_use.saturating_sub(1);
+            }
+        }
+        slot_released.notify_waiters();
+    }
+}
+
 /// Handles client-facing authentication interception.
 #[derive(Default)]
 pub struct AuthHandler {
     users: HashMap<Username, Credentials>,
+    limits: HashMap<Username, UserConnectionLimit>,
+    /// Limit for usernames not listed in `limits`; auth-free setups use it as
+    /// the catch-all because any username is accepted there.
+    default_limit: Option<UserConnectionLimit>,
+    /// Connections currently open per limited user. Kept in lock-step with
+    /// the slots handed to sessions, so no cleanup path can leak a count.
+    open: Arc<std::sync::Mutex<HashMap<Username, usize>>>,
+    /// Signalled whenever a slot goes back, so sessions waiting for one retry.
+    slot_released: Arc<tokio::sync::Notify>,
 }
 impl std::fmt::Debug for AuthHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthHandler")
             .field("enabled", &!self.users.is_empty())
             .field("user_count", &self.users.len())
+            .field("limited_users", &self.limits.len())
             .finish_non_exhaustive()
     }
 }
@@ -95,7 +174,10 @@ impl AuthHandler {
             users.insert(username.clone(), Credentials::new(username, password));
         }
 
-        Ok(Self { users })
+        Ok(Self {
+            users,
+            ..Self::default()
+        })
     }
 
     /// Create a new auth handler with multiple users
@@ -112,7 +194,10 @@ impl AuthHandler {
             users.insert(username.clone(), Credentials::new(username, password));
         }
 
-        Ok(Self { users })
+        Ok(Self {
+            users,
+            ..Self::default()
+        })
     }
 
     /// Check if authentication is enabled
@@ -141,6 +226,121 @@ impl AuthHandler {
                 .get(&username)
                 .is_some_and(|credentials| credentials.password.matches(password))
         }
+    }
+
+    /// Attach per-user simultaneous connection limits.
+    #[must_use]
+    pub fn with_connection_limits(mut self, limits: HashMap<String, UserConnectionLimit>) -> Self {
+        self.limits = limits
+            .into_iter()
+            .filter_map(|(username, limit)| {
+                Username::try_new(username)
+                    .ok()
+                    .map(|username| (username, limit))
+            })
+            .collect();
+        self
+    }
+
+    /// Apply `limit` to usernames that have no entry of their own.
+    #[must_use]
+    pub fn with_default_limit(mut self, limit: Option<UserConnectionLimit>) -> Self {
+        self.default_limit = limit;
+        self
+    }
+
+    /// The limit that applies to `username`, falling back to the default.
+    fn limit_for(&self, username: &Username) -> Option<UserConnectionLimit> {
+        self.limits.get(username).copied().or(self.default_limit)
+    }
+
+    /// Take one of `username`'s connection slots, or report that none is free.
+    ///
+    /// A user without a limit is admitted unmetered, so the returned slot never
+    /// needs releasing.
+    ///
+    /// # Errors
+    /// Returns the username when every slot is already taken.
+    pub fn try_take_user_slot(&self, username: &str) -> Result<UserSlot, Username> {
+        let Ok(username) = Username::try_new(username.to_owned()) else {
+            return Ok(UserSlot::Unmetered);
+        };
+        let Some(limit) = self.limit_for(&username) else {
+            return Ok(UserSlot::Unmetered);
+        };
+        let mut counts = self
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let in_use = counts.entry(username.clone()).or_insert(0);
+        if *in_use >= limit.get() {
+            return Err(username);
+        }
+        *in_use += 1;
+        drop(counts);
+        Ok(UserSlot::Held {
+            username,
+            open: Arc::clone(&self.open),
+            slot_released: Arc::clone(&self.slot_released),
+        })
+    }
+
+    /// Resolves the next time any slot returns to the pool. A waiter retries
+    /// after this fires; callers re-check the limit themselves.
+    pub async fn wait_for_user_slot(&self) {
+        self.slot_released.notified().await;
+    }
+
+    /// How many of `username`'s connection slots are taken right now.
+    #[must_use]
+    pub fn user_open_connections(&self, username: &str) -> usize {
+        let Ok(username) = Username::try_new(username.to_owned()) else {
+            return 0;
+        };
+        self.open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&username)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The connection limit configured for `username`, if any.
+    pub fn user_limit(&self, username: &str) -> Option<UserConnectionLimit> {
+        Username::try_new(username.to_owned())
+            .ok()
+            .and_then(|username| self.limit_for(&username))
+    }
+
+    /// Pass `slot` to the next session of `username` still waiting for one.
+    ///
+    /// The token itself is handed over, so the user's open count never dips and
+    /// no newcomer can slip in while a sleeping session should have moved on.
+    pub fn hand_over_user_slot(&self, username: &str, slot: UserSlot) {
+        if slot.is_metered() && username == slot.username() {
+            slot.hand_over();
+        }
+    }
+
+    /// Whether `username` has a free connection slot right now.
+    pub fn has_user_slot_room(&self, username: &str) -> bool {
+        let Ok(username) = Username::try_new(username.to_owned()) else {
+            return true;
+        };
+        // Users that never held a slot are dropped once the lock is taken.
+        let in_use = {
+            let mut open = self
+                .open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let in_use = open.get(&username).copied().unwrap_or(0);
+            if in_use == 0 {
+                open.remove(&username);
+            }
+            in_use
+        };
+        self.limit_for(&username)
+            .is_none_or(|limit| in_use < limit.get())
     }
 
     /// Handle an auth command - writes response to client and returns (`bytes_written`, `auth_success`)
@@ -175,6 +375,15 @@ impl AuthHandler {
                 let auth_success = stored_username.is_some_and(|username| {
                     self.validate_credentials_bytes(username, password.as_bytes())
                 });
+                // Over the limit the password is still checked, so the client sees
+                // a plain rejection; the session is simply never admitted.
+                if auth_success
+                    && let Some(username) = stored_username
+                    && self.try_take_user_slot(username).is_err()
+                {
+                    writer.write_all(AUTH_TOO_MANY_CONNECTIONS).await?;
+                    return Ok((AUTH_TOO_MANY_CONNECTIONS.len(), false));
+                }
 
                 let response = if auth_success {
                     AUTH_ACCEPTED

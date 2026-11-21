@@ -244,10 +244,11 @@ fn migrate_client_auth_users(config: &mut Config, raw: &toml::Value) -> bool {
         return false;
     };
 
-    config
-        .client_auth
-        .users
-        .push(UserCredentials { username, password });
+    config.client_auth.users.push(UserCredentials {
+        username,
+        password,
+        max_connections: None,
+    });
     true
 }
 

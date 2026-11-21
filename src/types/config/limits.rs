@@ -39,6 +39,38 @@ impl MaxConnections {
     }
 }
 
+/// Simultaneous client connections one authenticated user may open.
+///
+/// Absent means "no limit"; zero is rejected so an empty field can never lock a
+/// user out.
+#[nutype(
+    validate(greater = 0),
+    derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        Hash,
+        Display,
+        TryFrom,
+        AsRef,
+        Deref,
+        Serialize,
+        Deserialize
+    )
+)]
+pub struct UserConnectionLimit(usize);
+
+impl UserConnectionLimit {
+    /// Get the inner value
+    #[inline]
+    #[must_use]
+    pub fn get(&self) -> usize {
+        self.into_inner()
+    }
+}
+
 /// A non-zero maximum errors threshold
 ///
 /// Used to specify the maximum number of errors allowed before taking action.

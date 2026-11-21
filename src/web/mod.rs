@@ -29,6 +29,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+use crate::auth::AuthHandler;
 use crate::config::{Config, RoutingMode, load_config};
 use crate::proxy::NntpProxy;
 use crate::tui::{LogBuffer, TuiApp, TuiAppBuilder};
@@ -67,6 +68,7 @@ pub struct WebConfig {
 
 /// State shared by every request handler.
 struct WebState {
+    proxy: Arc<NntpProxy>,
     dashboard: Arc<Mutex<TuiApp>>,
     config_path: PathBuf,
     log_buffer: Option<LogBuffer>,
@@ -148,6 +150,7 @@ async fn serve(
     }
 
     let state = Arc::new(WebState {
+        proxy,
         dashboard,
         config_path,
         log_buffer,
@@ -243,11 +246,37 @@ async fn stats(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Respon
     }
     for user in json_rows(&mut dashboard, "top_users") {
         flatten_bytes(user);
+        add_user_limit(user, state.proxy.auth_handler());
     }
     if let Some(metrics) = dashboard.get_mut("metrics") {
         flatten_bytes(metrics);
     }
     Json(dashboard).into_response()
+}
+
+/// Attach the user's configured connection limit to a statistics row.
+///
+/// The limit and the live slot count live in the auth handler, not in the
+/// metrics snapshot, so the dashboard table would otherwise show only traffic.
+fn add_user_limit(row: &mut Value, auth: &AuthHandler) {
+    let Some(username) = row
+        .get("username")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let Some(map) = row.as_object_mut() else {
+        return;
+    };
+    map.insert(
+        "max_connections".to_owned(),
+        json!(auth.user_limit(&username).map(|limit| limit.get())),
+    );
+    map.insert(
+        "open_connections".to_owned(),
+        json!(auth.user_open_connections(&username)),
+    );
 }
 
 /// Mutable row views of one array field, empty when the field is missing.

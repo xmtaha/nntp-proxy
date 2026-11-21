@@ -64,6 +64,12 @@ pub const POSTING_NOT_PERMITTED: &[u8] = b"440 Posting not permitted\r\n";
 /// Backend error response (503)
 pub const BACKEND_ERROR: &[u8] = b"503 Backend error\r\n";
 
+/// Simultaneous connection limit reached for this user (502)
+///
+/// Deliberately a 502: it stays in the "not available" class like
+/// [`AUTH_FAILED`], so no client can read it as a success.
+pub const AUTH_TOO_MANY_CONNECTIONS: &[u8] = b"502 Too many connections for this user\r\n";
+
 /// Backend server unavailable response (400)
 pub const BACKEND_UNAVAILABLE: &[u8] = b"400 Backend server unavailable\r\n";
 

@@ -96,11 +96,16 @@ unhealthy_threshold = 3
 # Custom greeting:
 [client_auth]
 greeting = "200 NNTP Proxy ready"
+# Simultaneous connections allowed per user, unless the user sets its own.
+# Unset means unlimited.
+# max_connections_per_user = 8
 
 # Users:
 [[client_auth.users]]
 username = "clientusername"
 password = "client password"
+# Overrides max_connections_per_user for this user.
+# max_connections = 4
 #
 # [[client_auth.users]]
 # username = "bob"

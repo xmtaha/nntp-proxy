@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
+use crate::auth::UserSlot;
 use crate::cache::UnifiedCache;
 use crate::config::RoutingMode;
 use crate::pool::ConnectionProvider;
@@ -29,20 +30,154 @@ fn elapsed_nanos_u64(start: std::time::Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-struct ClientConnectionGuard<'a>(&'a NntpProxy);
+use std::sync::Mutex;
+use std::time::Instant;
+
+const USER_GATE_ADMIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Outcome of one attempt to take a user slot.
+enum Verdict {
+    Admitted,
+    Wait,
+}
+
+/// What one session may enter: its user's limit, or no metering at all.
+#[derive(Clone)]
+pub enum UserGateEntry {
+    Unmetered,
+    Limited {
+        username: String,
+        limit: usize,
+        /// A slot this connection already admitted, task #1 or a sleeping
+        /// session that is waiting to go on with it.
+        incoming: Option<UserSlot>,
+    },
+}
+
+// Slots are tokens for one client's place in its user's limit. Handing one
+// from a sleeping session to a worker moves the session's place with it.
+#[allow(clippy::struct_field_names)]
+pub struct ClientConnectionGuard<'a> {
+    proxy: &'a NntpProxy,
+    state: Mutex<GuardState>,
+}
+
+struct GuardState {
+    user_slot: Option<UserSlot>,
+}
 
 impl<'a> ClientConnectionGuard<'a> {
     fn new(proxy: &'a NntpProxy) -> Self {
         proxy.increment_active_clients();
         proxy.record_connection_opened();
-        Self(proxy)
+        Self {
+            proxy,
+            state: Mutex::new(GuardState { user_slot: None }),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, GuardState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether this connection already holds its user's slot.
+    pub fn holds_user(&self) -> bool {
+        self.state().user_slot.is_some()
+    }
+
+    /// Take a slot for a user whose limit this connection now has to respect.
+    /// Returns the gate to hand to the per-command loop; it keeps the slot.
+    pub fn take_user(&self, username: &str) -> UserGateEntry {
+        let mut state = self.state();
+        if state.user_slot.is_none() {
+            match self.proxy.auth_handler.try_take_user_slot(username) {
+                Ok(slot) => state.user_slot = Some(slot),
+                Err(username) => warn!(%username, "connection limit reached after admission"),
+            }
+        }
+        drop(state);
+        self.user_entry(username)
+    }
+
+    /// Take a slot for `username`, or hold until one frees up.
+    ///
+    /// Returns `true` once this connection owns a slot and `false` when the
+    /// limit was already hit before the deadline, so the caller answers 502.
+    pub async fn admit_user(
+        &self,
+        limit: usize,
+        username: &str,
+        incoming: &mut Option<UserSlot>,
+    ) -> bool {
+        if limit == 0 {
+            return false;
+        }
+        let deadline = Instant::now() + USER_GATE_ADMIT_TIMEOUT;
+        loop {
+            let verdict = {
+                let mut state = self.state();
+                if let Some(slot) = incoming.take() {
+                    state.user_slot = Some(slot);
+                    Verdict::Admitted
+                } else if state.user_slot.is_some() {
+                    Verdict::Admitted
+                } else {
+                    match self.proxy.auth_handler.try_take_user_slot(username) {
+                        Ok(slot) => {
+                            state.user_slot = Some(slot);
+                            Verdict::Admitted
+                        }
+                        Err(_) => Verdict::Wait,
+                    }
+                }
+            };
+            match verdict {
+                Verdict::Admitted => return true,
+                Verdict::Wait => {
+                    tokio::select! {
+                        () = self.proxy.auth_handler.wait_for_user_slot() => {}
+                        () = tokio::time::sleep_until(deadline.into()) => return false,
+                    }
+                }
+            }
+        }
+    }
+
+    /// The user limit this session enters once it knows who the client is.
+    pub(in crate::proxy) fn user_entry(&self, username: &str) -> UserGateEntry {
+        let Some(limit) = self.proxy.auth_handler.user_limit(username) else {
+            return UserGateEntry::Unmetered;
+        };
+        UserGateEntry::Limited {
+            username: username.to_owned(),
+            limit: limit.get(),
+            incoming: None,
+        }
+    }
+}
+
+impl ClientConnectionGuard<'static> {
+    /// A guard that counts no connections, for session tests that only need
+    /// the user gate.
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        static PROXY: std::sync::OnceLock<NntpProxy> = std::sync::OnceLock::new();
+        Self {
+            proxy: PROXY.get_or_init(|| {
+                NntpProxy::new_sync(super::tests::create_test_config(), RoutingMode::Hybrid)
+                    .expect("test proxy")
+            }),
+            state: Mutex::new(GuardState { user_slot: None }),
+        }
     }
 }
 
 impl Drop for ClientConnectionGuard<'_> {
     fn drop(&mut self) {
-        self.0.record_connection_closed();
-        self.0.decrement_active_clients();
+        self.proxy.record_connection_closed();
+        self.proxy.decrement_active_clients();
     }
 }
 
@@ -368,7 +503,7 @@ impl NntpProxy {
 
         // Check for stale pools before handling (lazy recreation after idle)
         self.check_and_clear_stale_pools();
-        let _connection_guard = ClientConnectionGuard::new(self);
+        let connection_guard = ClientConnectionGuard::new(self);
 
         async {
             let (backend_id, _backend_reservation) = self
@@ -388,6 +523,8 @@ impl NntpProxy {
                     backend_id,
                     &self.connection_providers[server_idx],
                     &self.servers[server_idx].name,
+                    &connection_guard,
+                    crate::proxy::UserGateEntry::Unmetered,
                 )
                 .await;
 
@@ -410,9 +547,9 @@ impl NntpProxy {
         Box::pin(async move {
             // Check for stale pools before handling (lazy recreation after idle)
             self.check_and_clear_stale_pools();
-            let _connection_guard = ClientConnectionGuard::new(self);
+            let mut connection_guard = ClientConnectionGuard::new(self);
 
-            self.handle_per_command_client(client_stream, client_addr)
+            self.handle_per_command_client(client_stream, client_addr, &mut connection_guard)
                 .await
         })
     }
@@ -422,6 +559,7 @@ impl NntpProxy {
         &self,
         mut client_stream: TcpStream,
         client_addr: ClientAddress,
+        connection_guard: &mut ClientConnectionGuard<'_>,
     ) -> Result<(), SessionError> {
         let mode_label = self.routing_mode_display_name();
         debug!(
@@ -436,7 +574,9 @@ impl NntpProxy {
         let mut session = self.create_session(client_addr, Some(self.router.clone()));
         let session_id = Self::generate_session_id(&session);
 
-        let metrics = session.handle_per_command_routing(client_stream).await;
+        let metrics = session
+            .handle_per_command_routing(client_stream, connection_guard)
+            .await;
 
         self.finalize_per_command_session(metrics, client_addr, &session_id, &session)
     }

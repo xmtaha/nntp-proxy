@@ -2413,6 +2413,7 @@ async fn test_per_command_body_pipeline_borrows_status_then_waits_for_body_with_
         users: vec![nntp_proxy::config::UserCredentials {
             username: "test-user".to_string(),
             password: "test-pass".to_string(),
+            max_connections: None,
         }],
         ..Default::default()
     };
@@ -2453,6 +2454,7 @@ async fn test_per_command_article_pipeline_borrows_status_then_waits_for_body_wi
         users: vec![nntp_proxy::config::UserCredentials {
             username: "test-user".to_string(),
             password: "test-pass".to_string(),
+            max_connections: None,
         }],
         ..Default::default()
     };
@@ -2561,6 +2563,7 @@ async fn test_per_command_direct_body_reuses_backend_connection_after_buffered_c
         users: vec![nntp_proxy::config::UserCredentials {
             username: "test-user".to_string(),
             password: "test-pass".to_string(),
+            max_connections: None,
         }],
         ..Default::default()
     };

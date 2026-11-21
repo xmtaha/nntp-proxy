@@ -152,6 +152,8 @@ struct PerCommandLoopState {
     backend_to_client_bytes: BackendToClientBytes,
     auth_username: ClientAuthState,
     auth_access: AuthenticationAccess,
+    /// The user whose limit this connection entered, once it has a slot.
+    gated_username: Option<String>,
 }
 
 const MAX_UPSTREAM_ARTICLE_WINDOW: usize = 16;
@@ -233,6 +235,7 @@ impl PerCommandLoopState {
             backend_to_client_bytes: BackendToClientBytes::zero(),
             auth_username: ClientAuthState::anonymous(),
             auth_access,
+            gated_username: None,
         }
     }
 
@@ -481,6 +484,7 @@ impl ClientSession {
     pub async fn handle_per_command_routing(
         &mut self,
         client_stream: TcpStream,
+        connection_guard: &crate::proxy::ClientConnectionGuard<'_>,
     ) -> Result<TransferMetrics, SessionError> {
         let Some(router) = self.router.clone() else {
             return Err(SessionError::Backend(anyhow::anyhow!(
@@ -493,6 +497,7 @@ impl ClientSession {
             &router,
             BufReader::with_capacity(READER_CAPACITY, client_read),
             crate::session::ClientWriter::new(client_write),
+            connection_guard,
         )
         .await
     }
@@ -502,14 +507,38 @@ impl ClientSession {
         router: &Arc<BackendSelector>,
         mut client_reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
         mut client_writer: crate::session::ClientWriter,
+        connection_guard: &crate::proxy::ClientConnectionGuard<'_>,
     ) -> Result<TransferMetrics, SessionError> {
         debug!("Client {} entering command loop", self.client_addr);
+        let mut user_gate = crate::proxy::UserGateEntry::Unmetered;
         let mut command_buf = [0u8; crate::protocol::MAX_COMMAND_LINE_OCTETS];
         let mut state = PerCommandLoopState::new(AuthenticationAccess::from_auth_enabled(
             self.auth_handler.is_enabled(),
         ));
 
         loop {
+            // A client that has authenticated is held to its connection limit
+            // here, once per command batch, not at greeting time: clients open
+            // their whole pool before sending AUTHINFO.
+            if let Some(username) = state.auth_username.username()
+                && state.gated_username.as_deref() != Some(username)
+                && let Some(limit) = self.auth_handler.user_limit(username)
+            {
+                let admitted = connection_guard
+                    .admit_user(limit.get(), username, &mut None)
+                    .await;
+                if !admitted {
+                    let inner = client_writer.get_mut();
+                    let _ = inner
+                        .write_all(crate::protocol::AUTH_TOO_MANY_CONNECTIONS)
+                        .await;
+                    let _ = inner.flush().await;
+                    break;
+                }
+                user_gate = connection_guard.take_user(username);
+                state.gated_username = Some(username.to_owned());
+            }
+
             let Some(mut batch) = self
                 .read_next_batch(
                     &mut client_reader,
@@ -529,6 +558,7 @@ impl ClientSession {
                 BatchLoopAction::Break => break,
                 BatchLoopAction::SwitchToStateful(initial_request) => {
                     let client_write = client_writer.into_inner();
+                    let user_gate = user_gate.clone();
                     return self
                         .switch_to_stateful_mode(
                             client_reader,
@@ -536,6 +566,10 @@ impl ClientSession {
                             initial_request,
                             state.client_to_backend_bytes.into(),
                             state.backend_to_client_bytes.into(),
+                            crate::session::handlers::hybrid::StatefulHandoffGate {
+                                connection_guard,
+                                user_gate,
+                            },
                         )
                         .await;
                 }

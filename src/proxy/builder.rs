@@ -231,14 +231,32 @@ impl NntpProxyBuilder {
                 .map(|(u, p)| (u.to_string(), p.to_string()))
                 .collect();
 
-            if all_users.is_empty() {
-                Arc::new(AuthHandler::default())
+            let limits = self.config.client_auth.connection_limits();
+            // Anyone may log in when auth is disabled, so the default limit
+            // applies as a catch-all; with users configured only listed ones
+            // match. ClientAuth::connection_limit() resolves the same order.
+            let fallback = if all_users.is_empty() {
+                self.config.client_auth.max_connections_per_user
             } else {
-                Arc::new(AuthHandler::with_users(all_users).with_context(|| {
-                    "Invalid authentication configuration. \
+                None
+            };
+            if all_users.is_empty() {
+                Arc::new(
+                    AuthHandler::default()
+                        .with_connection_limits(limits)
+                        .with_default_limit(fallback),
+                )
+            } else {
+                Arc::new(
+                    AuthHandler::with_users(all_users)
+                        .with_context(|| {
+                            "Invalid authentication configuration. \
                              If you set username/password in config, they cannot be empty. \
                              Remove them entirely to disable authentication."
-                })?)
+                        })?
+                        .with_connection_limits(limits)
+                        .with_default_limit(fallback),
+                )
             }
         };
 

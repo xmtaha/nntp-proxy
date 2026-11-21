@@ -4,6 +4,7 @@
 
 use crate::command::{AuthenticationAccess, CommandHandler, CommandPlan, RejectResponse};
 use crate::protocol::{RequestContext, RequestKind, RequestRouteClass};
+use crate::proxy::UserGateEntry;
 use crate::session::state::StatefulReadMode;
 use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
@@ -113,6 +114,55 @@ impl StatefulSessionExit {
                 StatefulConnectionDisposition::RetireBackend
             }
         }
+    }
+}
+
+/// A stream over the client's read half, borrowing the write half so a caller
+/// can watch for client input while still answering the client. Waiting for a
+/// user slot happens on this stream instead of the bare reader: a client that
+/// pipelines never looks writable, and without watching its input a waiting
+/// session would neither notice progress nor let its far side reach the backend.
+struct ClientInput<'a, R, W>((&'a mut R, &'a mut W));
+
+impl<R, W> tokio::io::AsyncRead for ClientInput<'_, R, W>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: Unpin,
+{
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.get_mut().0.0).poll_read(cx, buf)
+    }
+}
+
+impl<R, W> tokio::io::AsyncWrite for ClientInput<'_, R, W>
+where
+    R: Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut *self.get_mut().0.1).poll_write(cx, bytes)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.get_mut().0.1).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.get_mut().0.1).poll_shutdown(cx)
     }
 }
 
@@ -241,6 +291,38 @@ fn classify_authenticated_stateful_action(
     }
 }
 
+/// Connection accounting and the user admission gate for one stateful loop.
+pub(in crate::session) struct SessionUserGate<'a> {
+    connection_guard: &'a crate::proxy::ClientConnectionGuard<'a>,
+    user_gate: UserGateEntry,
+}
+
+impl<'a> SessionUserGate<'a> {
+    pub(in crate::session) fn new(
+        connection_guard: &'a crate::proxy::ClientConnectionGuard<'a>,
+        user_gate: UserGateEntry,
+    ) -> Self {
+        Self {
+            connection_guard,
+            user_gate,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::session) fn unmetered(
+        connection_guard: &'a crate::proxy::ClientConnectionGuard<'a>,
+    ) -> Self {
+        Self::new(connection_guard, UserGateEntry::Unmetered)
+    }
+}
+
+/// Everything a stateful loop needs besides its own command stream.
+pub(in crate::session) struct StatefulLoopContext<'a> {
+    pub(in crate::session) session: &'a ClientSession,
+    pub(in crate::session) backend_id: crate::types::BackendId,
+    pub(in crate::session) user_gate: SessionUserGate<'a>,
+}
+
 impl ClientSession {
     async fn handle_authenticated_stateful_request<W, BW>(
         &self,
@@ -354,6 +436,24 @@ impl ClientSession {
         Ok(())
     }
 
+    /// Answer the client with `reply` and close its session.
+    async fn reject_over_limit<W>(
+        &self,
+        mut client_write: W,
+    ) -> std::result::Result<(), StatefulLoopError>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        client_write
+            .write_all(crate::protocol::AUTH_TOO_MANY_CONNECTIONS)
+            .await
+            .map_err(|error| StatefulLoopError::client(error.into()))?;
+        client_write
+            .flush()
+            .await
+            .map_err(|error| StatefulLoopError::client(error.into()))
+    }
+
     /// Handle stateful session - acquire backend and proxy bidirectionally
     ///
     /// # Errors
@@ -365,6 +465,8 @@ impl ClientSession {
         backend_id: crate::types::BackendId,
         provider: &crate::pool::DeadpoolConnectionProvider,
         server_name: &str,
+        connection_guard: &crate::proxy::ClientConnectionGuard<'_>,
+        user_gate: UserGateEntry,
     ) -> Result<TransferMetrics, crate::session::SessionError> {
         use crate::protocol::BACKEND_UNAVAILABLE;
 
@@ -392,16 +494,19 @@ impl ClientSession {
         let (backend_read, backend_write) = tokio::io::split(conn_guard.stream_mut());
         let state = crate::session::state::SessionLoopState::new(self.auth_handler.is_enabled());
 
-        let result = self
-            .run_stateful_proxy_loop(
-                client_reader,
-                client_write,
-                backend_read,
-                backend_write,
-                state,
+        let result = ClientSession::run_stateful_proxy_loop(
+            StatefulLoopContext {
+                session: self,
                 backend_id,
-            )
-            .await;
+                user_gate: SessionUserGate::new(connection_guard, user_gate),
+            },
+            client_reader,
+            client_write,
+            backend_read,
+            backend_write,
+            state,
+        )
+        .await;
 
         match result {
             Ok(outcome) => {
@@ -429,20 +534,37 @@ impl ClientSession {
     ///
     /// Used by both stateful mode and hybrid mode (after switching).
     pub(in crate::session) async fn run_stateful_proxy_loop<R, W, BR, BW>(
-        &self,
+        context: StatefulLoopContext<'_>,
         mut client_reader: BufReader<R>,
         mut client_write: W,
         mut backend_read: BR,
         mut backend_write: BW,
         mut state: crate::session::state::SessionLoopState,
-        backend_id: crate::types::BackendId,
     ) -> std::result::Result<StatefulLoopResult, StatefulLoopError>
     where
-        R: tokio::io::AsyncRead + Unpin,
-        W: tokio::io::AsyncWrite + Unpin,
-        BR: tokio::io::AsyncRead + Unpin,
+        // Send lets the wait for a user slot ride in the client task.
+        R: tokio::io::AsyncRead + Unpin + Send,
+        W: tokio::io::AsyncWrite + Unpin + Send,
+        BR: tokio::io::AsyncRead + Unpin + Send,
         BW: tokio::io::AsyncWrite + Unpin,
     {
+        let StatefulLoopContext {
+            session,
+            backend_id,
+            user_gate,
+        } = context;
+        let SessionUserGate {
+            connection_guard,
+            user_gate,
+        } = user_gate;
+        let (mut gate_username, mut gate_limit, mut incoming_slot) = match user_gate {
+            UserGateEntry::Unmetered => (None, 0, None),
+            UserGateEntry::Limited {
+                username,
+                limit,
+                incoming,
+            } => (Some(username), limit, incoming),
+        };
         let mut command_reader = StatefulCommandReader::new();
         // Keep a small upstream window open while the client is producing
         // commands. Replies are still consumed and ordered by the framer below;
@@ -452,7 +574,7 @@ impl ClientSession {
         let exit = loop {
             // Periodic metrics flush
             if state.check_and_maybe_flush_metrics() {
-                state.flush_byte_deltas(&self.metrics, backend_id, self.username());
+                state.flush_byte_deltas(&session.metrics, backend_id, session.username());
             }
 
             let replies = state.take_ready_deferred_replies();
@@ -479,20 +601,26 @@ impl ClientSession {
                         .map_err(|error| StatefulLoopError::backend(error.into()))?;
                     pending_backend_writes = 0;
                 }
-                match self.read_stateful_backend_bytes(&mut backend_read).await {
+                match context
+                    .session
+                    .read_stateful_backend_bytes(&mut backend_read)
+                    .await
+                {
                     Ok(Some((buffer, len))) => {
-                        self.write_stateful_backend_bytes(
-                            &mut client_write,
-                            &buffer,
-                            len,
-                            &mut state,
-                        )
-                        .await?;
+                        context
+                            .session
+                            .write_stateful_backend_bytes(
+                                &mut ClientInput((&mut client_reader, &mut client_write)),
+                                &buffer,
+                                len,
+                                &mut state,
+                            )
+                            .await?;
                         continue;
                     }
                     Ok(None) => break StatefulSessionExit::BackendDisconnected,
                     Err(e) => {
-                        warn!(client = %self.client_addr, error = %e, "Backend read error");
+                        warn!(client = %session.client_addr, error = %e, "Backend read error");
                         break StatefulSessionExit::BackendReadError;
                     }
                 }
@@ -527,12 +655,39 @@ impl ClientSession {
                             let request = command_reader
                                 .take_request()
                                 .expect("ready command should have parsed request");
-                            state.auth_access = self.authentication_access(state.auth_access);
+                            state.auth_access = session.authentication_access(state.auth_access);
+
+                            // The gate is armed by the name this session authenticated as,
+                            // which in stateful mode is only known after AUTHINFO.
+                            if gate_username.is_none()
+                                && state.auth_access.can_access_backend()
+                                && let Some(limit) = state
+                                    .auth_username
+                                    .username()
+                                    .and_then(|name| session.auth_handler.user_limit(name))
+                            {
+                                gate_username = state.auth_username.username().map(str::to_owned);
+                                gate_limit = limit.get();
+                            }
 
                             if state.auth_access.can_access_backend() {
-                                self.handle_authenticated_stateful_request(
+                                if let Some(username) = gate_username.as_deref()
+                                    && gate_limit != 0
+                                    && !connection_guard.holds_user()
+                                {
+                                    // Never write upstream before the slot is
+                                    // ours, so a rejected client keeps its state.
+                                    let admitted = connection_guard
+                                        .admit_user(gate_limit, username, &mut incoming_slot)
+                                        .await;
+                                    if !admitted {
+                                        session.reject_over_limit(client_write).await?;
+                                        break StatefulSessionExit::ClientDisconnected;
+                                    }
+                                }
+                                session.handle_authenticated_stateful_request(
                                     &request,
-                                    &mut client_write,
+                                    &mut ClientInput((&mut client_reader, &mut client_write)),
                                     &mut backend_write,
                                     &mut state,
                                 )
@@ -550,17 +705,17 @@ impl ClientSession {
                                 // Auth path
                                 let auth_result = common::handle_stateful_auth_check(
                                     &request,
-                                    &mut client_write,
+                                    &mut ClientInput((&mut client_reader, &mut client_write)),
                                     &mut state.auth_username,
                                     &common::AuthCheckContext {
-                                        client_id: self.client_id(),
-                                        auth_handler: &self.auth_handler,
-                                        auth_state: &self.auth_state,
+                                        client_id: session.client_id(),
+                                        auth_handler: &session.auth_handler,
+                                        auth_state: &session.auth_state,
                                         routing_mode: &crate::config::RoutingMode::Stateful,
-                                        connection_stats: self.connection_stats(),
+                                        connection_stats: session.connection_stats(),
                                     },
-                                    self.client_addr,
-                                    |username| self.set_username(username),
+                                    session.client_addr,
+                                    |username| session.set_username(username),
                                 )
                                 .await
                                 .map_err(StatefulLoopError::client)?;
@@ -568,29 +723,25 @@ impl ClientSession {
                             }
                         }
                         Err(e) => {
-                            warn!(client = %self.client_addr, error = %e, "Client read error");
+                            warn!(client = %session.client_addr, error = %e, "Client read error");
                             break StatefulSessionExit::ClientReadError;
                         }
                     }
                 }
 
                 // Backend → Client
-                result = self.read_stateful_backend_bytes(&mut backend_read) => {
+                result = session.read_stateful_backend_bytes(&mut backend_read) => {
                     match result {
                         Ok(Some((buffer, len))) => {
                             // Complete output after select! returns so client readiness cannot
                             // cancel a partially completed write.
-                            self.write_stateful_backend_bytes(
-                                &mut client_write,
-                                &buffer,
-                                len,
-                                &mut state,
-                            )
-                            .await?;
+                            session
+                                .write_stateful_backend_bytes(&mut ClientInput((&mut client_reader, &mut client_write)), &buffer, len, &mut state)
+                                .await?;
                         }
                         Ok(None) => break StatefulSessionExit::BackendDisconnected,
                         Err(e) => {
-                            warn!(client = %self.client_addr, error = %e, "Backend read error");
+                            warn!(client = %session.client_addr, error = %e, "Backend read error");
                             break StatefulSessionExit::BackendReadError;
                         }
                     }
@@ -599,7 +750,7 @@ impl ClientSession {
         };
 
         // Final metrics - report any remaining byte deltas
-        state.flush_byte_deltas(&self.metrics, backend_id, self.username());
+        state.flush_byte_deltas(&session.metrics, backend_id, session.username());
 
         let disposition = exit.disposition();
         Ok(StatefulLoopResult::new(state.into_metrics(), disposition))
@@ -621,6 +772,7 @@ mod tests {
     use crate::metrics::MetricsCollector;
     use crate::pool::BufferPool;
     use crate::session::ClientSession;
+    use crate::session::handlers::stateful::{SessionUserGate, StatefulLoopContext};
     use crate::session::state::SessionLoopState;
     use crate::types::{BackendId, BufferSize, ClientAddress};
 
@@ -646,206 +798,217 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
-        #[test]
-        fn prop_compressed_stateful_pipeline_orders_mixed_local_errors(
-            extra in prop::collection::vec(prop_oneof![
-                Just(PipelineCommand::Date), Just(PipelineCommand::SyntaxError), Just(PipelineCommand::Oversized),
-            ], 0..8),
-            oversized_len in 511usize..800,
-            reader_capacity in prop_oneof![1usize..32, Just(511), Just(512)],
-        ) {
-            let mut commands = vec![PipelineCommand::Date, PipelineCommand::SyntaxError, PipelineCommand::Oversized];
-            commands.extend(extra);
-            commands.push(PipelineCommand::Date);
-            let mut wire = Vec::new();
-            let mut expected = Vec::new();
-            let mut backend_count = 0;
-            for command in commands {
-                match command {
-                    PipelineCommand::Date => {
-                        wire.extend_from_slice(b"DATE\r\n");
-                        expected.extend_from_slice(format!("111 {backend_count:014}\r\n").as_bytes());
-                        backend_count += 1;
-                    }
-                    PipelineCommand::SyntaxError => {
-                        wire.extend_from_slice(b"\r\n");
-                        expected.extend_from_slice(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE);
-                    }
-                    PipelineCommand::Oversized => {
-                        wire.extend(std::iter::repeat_n(b'X', oversized_len));
-                        wire.extend_from_slice(b"\r\n");
-                        expected.extend_from_slice(crate::protocol::COMMAND_TOO_LONG);
-                    }
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    #[test]
+    fn prop_compressed_stateful_pipeline_orders_mixed_local_errors(
+        extra in prop::collection::vec(prop_oneof![
+            Just(PipelineCommand::Date), Just(PipelineCommand::SyntaxError), Just(PipelineCommand::Oversized),
+        ], 0..8),
+        oversized_len in 511usize..800,
+        reader_capacity in prop_oneof![1usize..32, Just(511), Just(512)],
+    ) {
+        let mut commands = vec![PipelineCommand::Date, PipelineCommand::SyntaxError, PipelineCommand::Oversized];
+        commands.extend(extra);
+        commands.push(PipelineCommand::Date);
+        let mut wire = Vec::new();
+        let mut expected = Vec::new();
+        let mut backend_count = 0;
+        for command in commands {
+            match command {
+                PipelineCommand::Date => {
+                    wire.extend_from_slice(b"DATE\r\n");
+                    expected.extend_from_slice(format!("111 {backend_count:014}\r\n").as_bytes());
+                    backend_count += 1;
+                }
+                PipelineCommand::SyntaxError => {
+                    wire.extend_from_slice(b"\r\n");
+                    expected.extend_from_slice(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE);
+                }
+                PipelineCommand::Oversized => {
+                    wire.extend(std::iter::repeat_n(b'X', oversized_len));
+                    wire.extend_from_slice(b"\r\n");
+                    expected.extend_from_slice(crate::protocol::COMMAND_TOO_LONG);
                 }
             }
-            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            let actual = runtime.block_on(async {
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    use tokio::io::AsyncReadExt;
-                    let session = test_session();
-                    let (mut client, proxy_client) = tokio::io::duplex(16_384);
-                    let (backend, proxy_backend) = tokio::io::duplex(16_384);
-                    let mut backend = crate::compression::DecompressStream::new(backend);
-                    let proxy_backend = crate::compression::DecompressStream::new(proxy_backend);
-                    let (client_read, client_write) = tokio::io::split(proxy_client);
-                    let (backend_read, backend_write) = tokio::io::split(proxy_backend);
-                    let proxy = tokio::spawn(async move {
-                        session.run_stateful_proxy_loop(
-                            BufReader::with_capacity(reader_capacity, client_read), client_write,
-                            backend_read, backend_write, SessionLoopState::new(false), BackendId::from_index(0),
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let actual = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                use tokio::io::AsyncReadExt;
+                let session = test_session();
+                            let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
+                let (mut client, proxy_client) = tokio::io::duplex(16_384);
+                let (backend, proxy_backend) = tokio::io::duplex(16_384);
+                let mut backend = crate::compression::DecompressStream::new(backend);
+                let proxy_backend = crate::compression::DecompressStream::new(proxy_backend);
+                let (client_read, client_write) = tokio::io::split(proxy_client);
+                let (backend_read, backend_write) = tokio::io::split(proxy_backend);
+                let proxy = tokio::spawn(async move {
+                    ClientSession::run_stateful_proxy_loop(
+                        StatefulLoopContext {
+                            session: &session,
+                            backend_id: BackendId::from_index(0),
+                            user_gate: SessionUserGate::unmetered(&connection_guard),
+                        },
+                        BufReader::with_capacity(reader_capacity, client_read), client_write,
+                        backend_read, backend_write, SessionLoopState::new(false),
                         ).await
-                    });
-                    let client_exchange = async {
+                        });
+                        let client_exchange = async {
                         client.write_all(&wire).await.unwrap();
                         let mut actual = vec![0; expected.len()];
                         client.read_exact(&mut actual).await.unwrap();
                         drop(client);
                         actual
-                    };
-                    let backend_exchange = async {
+                        };
+                        let backend_exchange = async {
                         for index in 0..backend_count {
-                            let mut command = [0; 6];
-                            backend.read_exact(&mut command).await.unwrap();
-                            assert_eq!(&command, b"DATE\r\n");
-                            backend.write_all(format!("111 {index:014}\r\n").as_bytes()).await.unwrap();
-                            backend.flush().await.unwrap();
+                        let mut command = [0; 6];
+                        backend.read_exact(&mut command).await.unwrap();
+                        assert_eq!(&command, b"DATE\r\n");
+                        backend.write_all(format!("111 {index:014}\r\n").as_bytes()).await.unwrap();
+                        backend.flush().await.unwrap();
                         }
-                    };
-                    let (actual, ()) = tokio::join!(client_exchange, backend_exchange);
-                    let result = proxy.await.unwrap().unwrap();
-                    assert_eq!(result.disposition(), super::StatefulConnectionDisposition::RetireClient);
-                    actual
-                }).await.expect("mixed compressed pipeline stalled")
-            });
-            prop_assert_eq!(actual, expected);
-        }
+                        };
+                        let (actual, ()) = tokio::join!(client_exchange, backend_exchange);
+                        let result = proxy.await.unwrap().unwrap();
+                        assert_eq!(result.disposition(), super::StatefulConnectionDisposition::RetireClient);
+                        actual
+                        }).await.expect("mixed compressed pipeline stalled")
+                        });
+                        prop_assert_eq!(actual, expected);
+                        }
 
-        #[test]
-        fn prop_stateful_multiline_output_survives_client_readiness_during_backpressure(
-            first_case in 0usize..5,
-            first_body_len in 0usize..4096,
-            second_case in 0usize..5,
-            second_body_len in 0usize..4096,
-            accepted_prefix in 1usize..64,
-            backend_read_cap in 1usize..65,
-            reader_capacity in prop_oneof![1usize..40, Just(511), Just(512)],
-        ) {
-            let (first_request, first_response) =
-                crate::session::multiline_framing::framing_pipeline_fixture(first_case, first_body_len);
-            let (second_request, second_response) =
-                crate::session::multiline_framing::framing_pipeline_fixture(second_case, second_body_len);
-            let expected = [
-                first_response.as_slice(),
-                crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE,
-                second_response.as_slice(),
-            ].concat();
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            for compressed_backend in [false, true] {
-                let backend_first_request = first_request.clone();
-                let backend_second_request = second_request.clone();
-                let backend_first_response = first_response.clone();
-                let backend_second_response = second_response.clone();
-                let (keep_backend_open_tx, keep_backend_open_rx) =
-                    tokio::sync::oneshot::channel();
-                runtime.block_on(async {
-                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                    let session = test_session();
-                    let (mut client, proxy_client) = tokio::io::duplex(16_384);
-                    let (backend, proxy_backend) = tokio::io::duplex(16_384);
-                    let (backend, proxy_backend): (
+                        #[test]
+                        fn prop_stateful_multiline_output_survives_client_readiness_during_backpressure(
+                        first_case in 0usize..5,
+                        first_body_len in 0usize..4096,
+                        second_case in 0usize..5,
+                        second_body_len in 0usize..4096,
+                        accepted_prefix in 1usize..64,
+                        backend_read_cap in 1usize..65,
+                        reader_capacity in prop_oneof![1usize..40, Just(511), Just(512)],
+                        ) {
+                        let (first_request, first_response) =
+                        crate::session::multiline_framing::framing_pipeline_fixture(first_case, first_body_len);
+                        let (second_request, second_response) =
+                        crate::session::multiline_framing::framing_pipeline_fixture(second_case, second_body_len);
+                        let expected = [
+                        first_response.as_slice(),
+                        crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE,
+                        second_response.as_slice(),
+                        ].concat();
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                        for compressed_backend in [false, true] {
+                        let backend_first_request = first_request.clone();
+                        let backend_second_request = second_request.clone();
+                        let backend_first_response = first_response.clone();
+                        let backend_second_response = second_response.clone();
+                        let (keep_backend_open_tx, keep_backend_open_rx) =
+                        tokio::sync::oneshot::channel();
+                        runtime.block_on(async {
+                        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        let session = test_session();
+                            let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
+                        let (mut client, proxy_client) = tokio::io::duplex(16_384);
+                        let (backend, proxy_backend) = tokio::io::duplex(16_384);
+                        let (backend, proxy_backend): (
                         Box<dyn crate::stream::AsyncStream>,
                         Box<dyn crate::stream::AsyncStream>,
-                    ) = if compressed_backend {
+                        ) = if compressed_backend {
                         (
-                            Box::new(crate::compression::DecompressStream::new(backend)),
-                            Box::new(crate::compression::DecompressStream::new(proxy_backend)),
-                        )
-                    } else {
-                        (Box::new(backend), Box::new(proxy_backend))
-                    };
-                    let backend_task = tokio::spawn(async move {
-                        let (backend_read, mut backend_write) = tokio::io::split(backend);
-                        let mut reader = BufReader::new(backend_read);
-                        let mut command = Vec::new();
-                        reader.read_until(b'\n', &mut command).await.unwrap();
-                        assert_eq!(command, backend_first_request);
-                        backend_write
-                            .write_all(&backend_first_response)
-                            .await
-                            .unwrap();
-                        backend_write.flush().await.unwrap();
-                        command.clear();
-                        reader.read_until(b'\n', &mut command).await.unwrap();
-                        assert_eq!(command, backend_second_request);
-                        backend_write
-                            .write_all(&backend_second_response)
-                            .await
-                            .unwrap();
-                        backend_write.flush().await.unwrap();
-                        let _ = keep_backend_open_rx.await;
-                    });
+                        Box::new(crate::compression::DecompressStream::new(backend)),
+                        Box::new(crate::compression::DecompressStream::new(proxy_backend)),
+                    )
+                } else {
+                    (Box::new(backend), Box::new(proxy_backend))
+                };
+                let backend_task = tokio::spawn(async move {
+                    let (backend_read, mut backend_write) = tokio::io::split(backend);
+                    let mut reader = BufReader::new(backend_read);
+                    let mut command = Vec::new();
+                    reader.read_until(b'\n', &mut command).await.unwrap();
+                    assert_eq!(command, backend_first_request);
+                    backend_write
+                        .write_all(&backend_first_response)
+                        .await
+                        .unwrap();
+                    backend_write.flush().await.unwrap();
+                    command.clear();
+                    reader.read_until(b'\n', &mut command).await.unwrap();
+                    assert_eq!(command, backend_second_request);
+                    backend_write
+                        .write_all(&backend_second_response)
+                        .await
+                        .unwrap();
+                    backend_write.flush().await.unwrap();
+                    let _ = keep_backend_open_rx.await;
+                });
 
-                    let partial = Arc::new(Notify::new());
-                    let complete = Arc::new(Notify::new());
-                    let writer = GateWriter::with_first_accept_limit(
-                        expected.len(),
-                        Arc::clone(&partial),
-                        Arc::clone(&complete),
-                        Some(accepted_prefix),
-                    );
-                    let writer_control = writer.control();
-                    let (proxy_client_read, _) = tokio::io::split(proxy_client);
-                    let (backend_read, backend_write) = tokio::io::split(proxy_backend);
-                    let backend_read_cap =
-                        backend_read_cap.min((first_response.len() / 2).max(1));
-                    let backend_read = ReadCap::new(backend_read, backend_read_cap);
-                    let proxy = tokio::spawn(async move {
-                        session.run_stateful_proxy_loop(
-                            BufReader::with_capacity(reader_capacity, proxy_client_read),
-                            writer,
-                            backend_read,
-                            backend_write,
-                            SessionLoopState::new(false),
-                            BackendId::from_index(0),
+                let partial = Arc::new(Notify::new());
+                let complete = Arc::new(Notify::new());
+                let writer = GateWriter::with_first_accept_limit(
+                    expected.len(),
+                    Arc::clone(&partial),
+                    Arc::clone(&complete),
+                    Some(accepted_prefix),
+                );
+                let writer_control = writer.control();
+                let (proxy_client_read, _) = tokio::io::split(proxy_client);
+                let (backend_read, backend_write) = tokio::io::split(proxy_backend);
+                let backend_read_cap =
+                    backend_read_cap.min((first_response.len() / 2).max(1));
+                let backend_read = ReadCap::new(backend_read, backend_read_cap);
+                let proxy = tokio::spawn(async move {
+                    ClientSession::run_stateful_proxy_loop(
+                        StatefulLoopContext {
+                            session: &session,
+                            backend_id: BackendId::from_index(0),
+                            user_gate: SessionUserGate::unmetered(&connection_guard),
+                        },
+                        BufReader::with_capacity(reader_capacity, proxy_client_read),
+                        writer,
+                        backend_read,
+                        backend_write,
+                        SessionLoopState::new(false),
                         ).await
-                    });
+                        });
 
-                    client.write_all(&first_request).await.unwrap();
-                    tokio::time::timeout(
+                        client.write_all(&first_request).await.unwrap();
+                        tokio::time::timeout(
                         std::time::Duration::from_secs(5),
                         writer_control.partial.notified(),
-                    ).await.expect("first backend response did not reach gated writer");
+                        ).await.expect("first backend response did not reach gated writer");
 
-                    // These bytes become readable while the first response write
-                    // is suspended; completing that response must retain priority.
-                    client.write_all(b"\r\n").await.unwrap();
-                    client.write_all(&second_request).await.unwrap();
-                    writer_control.release();
+                        // These bytes become readable while the first response write
+                        // is suspended; completing that response must retain priority.
+                        client.write_all(b"\r\n").await.unwrap();
+                        client.write_all(&second_request).await.unwrap();
+                        writer_control.release();
 
-                    tokio::time::timeout(
+                        tokio::time::timeout(
                         std::time::Duration::from_secs(5),
                         writer_control.complete.notified(),
-                    ).await.expect("ordered multiline output did not finish");
-                    assert_eq!(writer_control.bytes(), expected);
-                    drop(client);
-                    let result = tokio::time::timeout(std::time::Duration::from_secs(5), proxy)
+                        ).await.expect("ordered multiline output did not finish");
+                        assert_eq!(writer_control.bytes(), expected);
+                        drop(client);
+                        let result = tokio::time::timeout(std::time::Duration::from_secs(5), proxy)
                         .await.expect("stateful proxy did not stop")
                         .expect("stateful proxy task panicked")
                         .expect("stateful proxy failed");
-                    assert_eq!(result.disposition(), super::StatefulConnectionDisposition::RetireClient);
-                    let _ = keep_backend_open_tx.send(());
-                    backend_task.await.unwrap();
-                    })
-                    .await
-                    .expect("gated multiline property stalled");
-                });
-            }
-        }
-    }
+                        assert_eq!(result.disposition(), super::StatefulConnectionDisposition::RetireClient);
+                        let _ = keep_backend_open_tx.send(());
+                        backend_task.await.unwrap();
+                        })
+                        .await
+                        .expect("gated multiline property stalled");
+                        });
+                        }
+                        }
+                        }
 
     #[test]
     fn stateful_session_exit_never_assumes_reader_state_is_reset() {
@@ -1028,6 +1191,7 @@ mod tests {
     async fn compressed_stateful_request_flushes_a_partial_window() {
         use tokio::io::AsyncReadExt;
         let session = test_session();
+        let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
         let (mut client, proxy_client) = tokio::io::duplex(4096);
         let (backend, proxy_backend) = tokio::io::duplex(4096);
         let mut backend = crate::compression::DecompressStream::new(backend);
@@ -1035,16 +1199,19 @@ mod tests {
         let (client_read, client_write) = tokio::io::split(proxy_client);
         let (backend_read, backend_write) = tokio::io::split(proxy_backend);
         let proxy = tokio::spawn(async move {
-            session
-                .run_stateful_proxy_loop(
-                    BufReader::new(client_read),
-                    client_write,
-                    backend_read,
-                    backend_write,
-                    SessionLoopState::new(false),
-                    BackendId::from_index(0),
-                )
-                .await
+            ClientSession::run_stateful_proxy_loop(
+                StatefulLoopContext {
+                    session: &session,
+                    backend_id: BackendId::from_index(0),
+                    user_gate: SessionUserGate::unmetered(&connection_guard),
+                },
+                BufReader::new(client_read),
+                client_write,
+                backend_read,
+                backend_write,
+                SessionLoopState::new(false),
+            )
+            .await
         });
         for commands in [b"DATE\r\n".as_slice(), b"DATE\r\nDA".as_slice()] {
             client.write_all(commands).await.unwrap();
@@ -1081,22 +1248,26 @@ mod tests {
             [vec![b'X'; 600], b"\r\n".to_vec()].concat(),
         ] {
             let session = test_session();
+            let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
             let (mut client, proxy_client) = tokio::io::duplex(4096);
             let (backend, proxy_backend) = tokio::io::duplex(4096);
             let (mut backend_read, mut backend_write) = tokio::io::split(backend);
             let (client_read, client_write) = tokio::io::split(proxy_client);
             let (proxy_backend_read, proxy_backend_write) = tokio::io::split(proxy_backend);
             let proxy = tokio::spawn(async move {
-                session
-                    .run_stateful_proxy_loop(
-                        BufReader::new(client_read),
-                        client_write,
-                        proxy_backend_read,
-                        proxy_backend_write,
-                        SessionLoopState::new(false),
-                        BackendId::from_index(0),
-                    )
-                    .await
+                ClientSession::run_stateful_proxy_loop(
+                    StatefulLoopContext {
+                        session: &session,
+                        backend_id: BackendId::from_index(0),
+                        user_gate: SessionUserGate::unmetered(&connection_guard),
+                    },
+                    BufReader::new(client_read),
+                    client_write,
+                    proxy_backend_read,
+                    proxy_backend_write,
+                    SessionLoopState::new(false),
+                )
+                .await
             });
             client.write_all(b"DATE\r\n").await.unwrap();
             let mut command = [0; 6];
@@ -1137,7 +1308,6 @@ mod tests {
     #[tokio::test]
     async fn backend_output_is_not_cancelled_by_ready_client_input() {
         let session = test_session();
-        let backend_id = BackendId::from_index(0);
         let state = SessionLoopState::new(false);
         let first_response = b"111 first\r\n";
         let second_response = b"111 second\r\n";
@@ -1167,16 +1337,20 @@ mod tests {
         let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
 
         let proxy = tokio::spawn(async move {
-            session
-                .run_stateful_proxy_loop(
-                    client_reader,
-                    writer,
-                    backend_read,
-                    backend_write,
-                    state,
-                    backend_id,
-                )
-                .await
+            let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
+            ClientSession::run_stateful_proxy_loop(
+                StatefulLoopContext {
+                    session: &session,
+                    backend_id: BackendId::from_index(0),
+                    user_gate: SessionUserGate::unmetered(&connection_guard),
+                },
+                client_reader,
+                writer,
+                backend_read,
+                backend_write,
+                state,
+            )
+            .await
         });
 
         writer_control.partial.notified().await;
@@ -1223,20 +1397,24 @@ mod tests {
         });
 
         client_end.write_all(b"DATE\r\nDATE\r\n").await.unwrap();
+        let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
         let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
         let client_reader = BufReader::new(proxy_client_read);
         let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
         let proxy = tokio::spawn(async move {
-            session
-                .run_stateful_proxy_loop(
-                    client_reader,
-                    proxy_client_write,
-                    backend_read,
-                    backend_write,
-                    state,
-                    BackendId::from_index(0),
-                )
-                .await
+            ClientSession::run_stateful_proxy_loop(
+                StatefulLoopContext {
+                    session: &session,
+                    backend_id: BackendId::from_index(0),
+                    user_gate: SessionUserGate::unmetered(&connection_guard),
+                },
+                client_reader,
+                proxy_client_write,
+                backend_read,
+                backend_write,
+                state,
+            )
+            .await
         });
 
         let mut responses = [0u8; b"111 first\r\n111 second\r\n".len()];
@@ -1260,7 +1438,6 @@ mod tests {
     #[tokio::test]
     async fn test_client_disconnect_returns_metrics() {
         let session = test_session();
-        let backend_id = BackendId::from_index(0);
         let state = SessionLoopState::new(false); // auth disabled → unrestricted access
 
         let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
@@ -1285,19 +1462,24 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         drop(client_end);
 
+        let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
         let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
         let client_reader = BufReader::new(proxy_client_read);
         let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            session.run_stateful_proxy_loop(
+            ClientSession::run_stateful_proxy_loop(
+                StatefulLoopContext {
+                    session: &session,
+                    backend_id: BackendId::from_index(0),
+                    user_gate: SessionUserGate::unmetered(&connection_guard),
+                },
                 client_reader,
                 proxy_client_write,
                 backend_read,
                 backend_write,
                 state,
-                backend_id,
             ),
         )
         .await
@@ -1316,9 +1498,9 @@ mod tests {
     #[tokio::test]
     async fn test_backend_disconnect_returns_metrics() {
         let session = test_session();
-        let backend_id = BackendId::from_index(0);
         let state = SessionLoopState::new(false);
 
+        let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
         let (client_end, proxy_client_end) = tokio::io::duplex(4096);
         let (backend_end, proxy_backend_end) = tokio::io::duplex(4096);
 
@@ -1331,13 +1513,17 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            session.run_stateful_proxy_loop(
+            ClientSession::run_stateful_proxy_loop(
+                StatefulLoopContext {
+                    session: &session,
+                    backend_id: BackendId::from_index(0),
+                    user_gate: SessionUserGate::unmetered(&connection_guard),
+                },
                 client_reader,
                 proxy_client_write,
                 backend_read,
                 backend_write,
                 state,
-                backend_id,
             ),
         )
         .await
@@ -1354,7 +1540,6 @@ mod tests {
     #[tokio::test]
     async fn test_auth_disabled_skips_auth_check() {
         let session = test_session(); // auth disabled by default (None, None)
-        let backend_id = BackendId::from_index(0);
         let state = SessionLoopState::new(false); // auth disabled
 
         let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
@@ -1379,19 +1564,24 @@ mod tests {
             .unwrap();
         drop(client_end);
 
+        let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
         let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
         let client_reader = BufReader::new(proxy_client_read);
         let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            session.run_stateful_proxy_loop(
+            ClientSession::run_stateful_proxy_loop(
+                StatefulLoopContext {
+                    session: &session,
+                    backend_id: BackendId::from_index(0),
+                    user_gate: SessionUserGate::unmetered(&connection_guard),
+                },
                 client_reader,
                 proxy_client_write,
                 backend_read,
                 backend_write,
                 state,
-                backend_id,
             ),
         )
         .await
@@ -1411,7 +1601,6 @@ mod tests {
     #[tokio::test]
     async fn test_stateful_loop_forwards_non_utf8_command_bytes() {
         let session = test_session();
-        let backend_id = BackendId::from_index(0);
         let state = SessionLoopState::new(false);
         let command = b"XFOO \xff\r\n";
 
@@ -1431,19 +1620,24 @@ mod tests {
         client_end.write_all(command).await.unwrap();
         drop(client_end);
 
+        let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
         let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
         let client_reader = BufReader::new(proxy_client_read);
         let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            session.run_stateful_proxy_loop(
+            ClientSession::run_stateful_proxy_loop(
+                StatefulLoopContext {
+                    session: &session,
+                    backend_id: BackendId::from_index(0),
+                    user_gate: SessionUserGate::unmetered(&connection_guard),
+                },
                 client_reader,
                 proxy_client_write,
                 backend_read,
                 backend_write,
                 state,
-                backend_id,
             ),
         )
         .await
@@ -1516,7 +1710,6 @@ mod tests {
     #[tokio::test]
     async fn stateful_loop_rejects_oversized_command_then_handles_next_command() {
         let session = test_session();
-        let backend_id = BackendId::from_index(0);
         let state = SessionLoopState::new(false);
 
         let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
@@ -1539,22 +1732,26 @@ mod tests {
             }
         });
 
+        let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
         let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
         let client_reader = BufReader::new(proxy_client_read);
         let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
 
         let session_task = tokio::spawn(async move {
-            session
-                .run_stateful_proxy_loop(
-                    client_reader,
-                    proxy_client_write,
-                    backend_read,
-                    backend_write,
-                    state,
-                    backend_id,
-                )
-                .await
-                .unwrap()
+            ClientSession::run_stateful_proxy_loop(
+                StatefulLoopContext {
+                    session: &session,
+                    backend_id: BackendId::from_index(0),
+                    user_gate: SessionUserGate::unmetered(&connection_guard),
+                },
+                client_reader,
+                proxy_client_write,
+                backend_read,
+                backend_write,
+                state,
+            )
+            .await
+            .unwrap()
         });
 
         let oversized = vec![b'x'; crate::protocol::MAX_COMMAND_LINE_OCTETS + 100];
@@ -1589,7 +1786,6 @@ mod tests {
     #[tokio::test]
     async fn test_byte_accumulation() {
         let session = test_session();
-        let backend_id = BackendId::from_index(0);
         let state = SessionLoopState::new(false).with_initial_bytes(100, 200);
 
         let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
@@ -1612,19 +1808,24 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         drop(client_end);
 
+        let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
         let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
         let client_reader = BufReader::new(proxy_client_read);
         let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            session.run_stateful_proxy_loop(
+            ClientSession::run_stateful_proxy_loop(
+                StatefulLoopContext {
+                    session: &session,
+                    backend_id: BackendId::from_index(0),
+                    user_gate: SessionUserGate::unmetered(&connection_guard),
+                },
                 client_reader,
                 proxy_client_write,
                 backend_read,
                 backend_write,
                 state,
-                backend_id,
             ),
         )
         .await
@@ -1643,6 +1844,136 @@ mod tests {
             result.backend_to_client.as_u64() >= 200,
             "b2c should include at least initial bytes: {}",
             result.backend_to_client.as_u64()
+        );
+    }
+
+    /// Poll the loop once, then return whatever the client has been sent.
+    async fn read_reply<L>(
+        client: &mut tokio::io::DuplexStream,
+        proxy_loop: &mut std::pin::Pin<&mut L>,
+    ) -> Option<Vec<u8>>
+    where
+        L: std::future::Future<
+                Output = super::Result<super::StatefulLoopResult, super::StatefulLoopError>,
+            >,
+    {
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(200), proxy_loop.as_mut()).await;
+        let mut buffer = [0u8; 256];
+        std::future::poll_fn(|cx| {
+            std::pin::Pin::new(&mut *client)
+                .poll_read(cx, &mut tokio::io::ReadBuf::new(&mut buffer))
+        })
+        .await
+        .expect("client read failed");
+        let filled = buffer.iter().filter(|byte| **byte != 0).count();
+        (filled > 0).then(|| buffer[..filled].to_vec())
+    }
+    /// The stateful loop learns the client's name only from AUTHINFO, so the
+    /// user limit has to be armed there and not at connection setup.
+    #[tokio::test]
+    async fn authenticated_stateful_session_holds_the_user_limit() {
+        use tokio::io::AsyncReadExt as _;
+
+        let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 4);
+        let auth_handler = Arc::new(
+            AuthHandler::with_users(vec![("tester".to_owned(), "secret".to_owned())])
+                .unwrap()
+                .with_connection_limits(std::collections::HashMap::from([(
+                    "tester".to_owned(),
+                    crate::types::config::UserConnectionLimit::try_new(1).unwrap(),
+                )])),
+        );
+        let session = ClientSession::builder(
+            ClientAddress::from(addr),
+            buffer_pool,
+            auth_handler.clone(),
+            MetricsCollector::new(1),
+        )
+        .build();
+        let connection_guard = crate::proxy::ClientConnectionGuard::new_for_test();
+
+        let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, proxy_backend_end) = tokio::io::duplex(4096);
+        let mut backend_end = backend_end;
+        let echo = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                match backend_end.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let _ = backend_end.write_all(b"200 ok\r\n").await;
+                    }
+                }
+            }
+        });
+
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+        // Borrows the session and guard, so it runs on this task, not a spawned one.
+        let loop_future = ClientSession::run_stateful_proxy_loop(
+            StatefulLoopContext {
+                session: &session,
+                backend_id: BackendId::from_index(0),
+                user_gate: SessionUserGate::unmetered(&connection_guard),
+            },
+            BufReader::new(proxy_client_read),
+            proxy_client_write,
+            backend_read,
+            backend_write,
+            SessionLoopState::new(true),
+        );
+        let mut loop_future = std::pin::pin!(loop_future);
+
+        // Drive the loop by hand: both sides of the proxy live in this task.
+        for (command, reply) in [
+            ("AUTHINFO USER tester\r\n", "381 Password required\r\n"),
+            (
+                "AUTHINFO PASS secret\r\n",
+                "281 Authentication accepted\r\n",
+            ),
+        ] {
+            client_end.write_all(command.as_bytes()).await.unwrap();
+            loop {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    loop_future.as_mut(),
+                )
+                .await;
+                if let Some(answer) = read_reply(&mut client_end, &mut loop_future).await {
+                    assert_eq!(answer, reply.as_bytes());
+                    break;
+                }
+            }
+        }
+
+        // The slot is taken when the first authenticated command is forwarded.
+        client_end.write_all(b"DATE\r\n").await.unwrap();
+        loop {
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(200), loop_future.as_mut())
+                    .await;
+            if let Some(answer) = read_reply(&mut client_end, &mut loop_future).await {
+                assert_eq!(answer, b"200 ok\r\n");
+                break;
+            }
+        }
+        assert!(
+            connection_guard.holds_user(),
+            "the stateful session should have taken the user slot on login"
+        );
+        let competing = auth_handler
+            .try_take_user_slot("tester")
+            .expect("a second session for the same user must be refused at limit 1");
+
+        drop(client_end);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), loop_future).await;
+        drop(competing);
+        echo.abort();
+        assert!(
+            auth_handler.try_take_user_slot("tester").is_ok(),
+            "the slot must be released when the session ends"
         );
     }
 }

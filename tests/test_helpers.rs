@@ -1018,8 +1018,10 @@ pub fn create_test_config_with_auth(
             users: vec![UserCredentials {
                 username: username.to_string(),
                 password: password.to_string(),
+                max_connections: None,
             }],
             greeting: None,
+            max_connections_per_user: None,
         },
     }
 }

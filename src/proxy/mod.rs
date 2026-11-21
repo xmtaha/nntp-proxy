@@ -14,6 +14,7 @@ mod builder;
 mod lifecycle;
 
 pub use builder::NntpProxyBuilder;
+pub use lifecycle::{ClientConnectionGuard, UserGateEntry};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
@@ -220,6 +221,12 @@ impl NntpProxy {
     #[inline]
     pub const fn metrics(&self) -> &MetricsCollector {
         &self.metrics
+    }
+
+    /// Client authentication state, including the per-user connection gate.
+    #[must_use]
+    pub fn auth_handler(&self) -> &AuthHandler {
+        &self.auth_handler
     }
 
     /// Get connection stats aggregator

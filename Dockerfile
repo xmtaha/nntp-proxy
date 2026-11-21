@@ -26,6 +26,12 @@ RUN cargo build --release --bin nntp-proxy
 # Runtime stage
 FROM debian:bookworm-slim
 
+# Links the published image to the repository, which is what makes it show up
+# under the repo's "Packages" section on GitHub.
+LABEL org.opencontainers.image.source="https://github.com/xmtaha/nntp-proxy" \
+      org.opencontainers.image.description="NNTP proxy with pooling, caching, and tiered routing" \
+      org.opencontainers.image.licenses="MIT"
+
 # Install runtime dependencies and netcat for health checks
 RUN apt-get update && apt-get install -y \
     ca-certificates \

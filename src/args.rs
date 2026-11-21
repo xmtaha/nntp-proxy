@@ -162,7 +162,7 @@ pub struct CommonArgs {
     )]
     pub store_article_bodies: Option<bool>,
 
-    /// Number of worker threads (default: 1, use 0 for CPU cores)
+    /// Number of worker threads (default: one per CPU core, use 1 for single-threaded)
     #[arg(short, long, env = "NNTP_PROXY_THREADS", help_heading = "Performance")]
     pub threads: Option<ThreadCount>,
 }

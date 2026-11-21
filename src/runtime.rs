@@ -35,12 +35,14 @@ impl CpuPinning {
 impl RuntimeConfig {
     /// Create runtime config from optional thread count
     ///
-    /// If `threads` is None, defaults to 1 thread.
-    /// If `threads` is Some(ThreadCount(0)), uses number of CPU cores.
-    /// Single-threaded runtime is used if threads == 1.
+    /// If `threads` is None, uses one worker per available CPU core.
+    /// Single-threaded runtime is used if the resolved count is 1.
     #[must_use]
     pub fn from_args(threads: Option<ThreadCount>) -> Self {
-        let worker_threads = threads.map_or(1, |t| t.get());
+        let worker_threads = threads.map_or_else(
+            || std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+            |t| t.get(),
+        );
 
         Self {
             worker_threads,
@@ -77,13 +79,12 @@ impl RuntimeConfig {
     pub fn build_runtime(self) -> Result<tokio::runtime::Runtime> {
         let rt = if self.is_single_threaded() {
             tracing::info!("Starting NNTP proxy with single-threaded runtime");
-            let rt = tokio::runtime::Builder::new_current_thread()
+            // No CPU pinning here: the current-thread runtime already runs on
+            // one core, and pinning it just stops the OS from migrating it
+            // away from a core that is busy with something else.
+            tokio::runtime::Builder::new_current_thread()
                 .enable_all()
-                .build()?;
-            if self.cpu_pinning.is_enabled() {
-                pin_current_thread_to_first_available_cpu(self.worker_threads);
-            }
-            rt
+                .build()?
         } else {
             let num_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
             tracing::info!(
@@ -147,12 +148,6 @@ fn build_single_cpu_affinity_set(core: usize) -> rustix::thread::CpuSet {
 }
 
 #[cfg(target_os = "linux")]
-fn pin_current_thread_to_first_available_cpu(requested_cores: usize) {
-    let cores = available_cpu_cores(requested_cores);
-    pin_current_thread_to_cpu(cores[0]);
-}
-
-#[cfg(target_os = "linux")]
 fn configure_worker_cpu_pinning(builder: &mut tokio::runtime::Builder, worker_threads: usize) {
     use std::sync::{
         Arc,
@@ -211,11 +206,6 @@ fn cpu_cores_from_affinity(
     }
 
     cores
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pin_current_thread_to_first_available_cpu(_requested_cores: usize) {
-    tracing::info!("CPU pinning not available on this platform");
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1142,9 +1132,11 @@ mod tests {
     fn test_runtime_config_from_args_default() {
         let config = RuntimeConfig::from_args(None);
 
-        // Should default to single-threaded (1 thread)
-        assert_eq!(config.worker_threads(), 1);
-        assert!(config.is_single_threaded());
+        // Defaults to one worker per available CPU core
+        assert_eq!(
+            config.worker_threads(),
+            std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+        );
         assert_eq!(config.cpu_pinning, CpuPinning::Enabled);
     }
 
@@ -1230,7 +1222,10 @@ mod tests {
         // We can't test ThreadCount::new(0) directly as it returns None,
         // but we can test the from_args behavior
         let config = RuntimeConfig::from_args(None);
-        assert_eq!(config.worker_threads(), 1); // Defaults to 1
+        assert_eq!(
+            config.worker_threads(),
+            std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+        );
     }
 
     #[test]
@@ -1475,9 +1470,12 @@ mod tests {
     }
 
     #[test]
-    fn test_default_is_single_threaded() {
+    fn test_default_uses_one_worker_per_core() {
         let config = RuntimeConfig::default();
-        assert!(config.is_single_threaded());
+        assert_eq!(
+            config.worker_threads(),
+            std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+        );
     }
 
     #[test]

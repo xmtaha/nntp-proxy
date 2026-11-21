@@ -12,8 +12,8 @@
 [proxy]
 # Port to listen on (default: 8119)
 port = 8119
-# Worker threads (default: 1; use 0 for one per CPU core)
-threads = 1
+# Worker threads (default: one per CPU core; use 1 for single-threaded)
+threads = 0
 
 [routing]
 # Routing mode: "hybrid" (default), "per-command", or "stateful"

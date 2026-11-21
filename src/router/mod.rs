@@ -38,6 +38,7 @@ mod strategies;
 
 use anyhow::Result;
 use nutype::nutype;
+use smallvec::SmallVec;
 use std::cmp::Ordering as CmpOrdering;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,6 +48,7 @@ use tracing::{debug, info};
 use crate::cache::{ArticleAvailability, AvailabilityMask, AvailabilitySlot};
 use crate::config::{BackendSelectionStrategy, QueuePressureLimits};
 use crate::pool::DeadpoolConnectionProvider;
+use crate::pool::provider::DeadpoolStatusCounts;
 use crate::types::{BackendId, ClientId, ServerName};
 use strategies::{LeastLoaded, WeightedRoundRobin};
 
@@ -60,6 +62,41 @@ mod route_mode {
 struct SelectedBackend<'a> {
     backend: &'a BackendInfo,
     pending_snapshot: Option<usize>,
+}
+
+/// Reservation of a stateful (client-pinned) backend slot.
+///
+/// Hybrid mode pins one backend connection per client for the whole session, so
+/// without a reservation every extra client waits out the pool checkout timeout
+/// before failing. The slot is released when the guard drops.
+pub struct StatefulSlotGuard {
+    router: Arc<BackendSelector>,
+    backend_id: BackendId,
+}
+
+impl Drop for StatefulSlotGuard {
+    fn drop(&mut self) {
+        self.router.release_stateful(self.backend_id);
+    }
+}
+
+/// Pool counters for one tier, sampled once per selection.
+type PoolStatusSnapshot = SmallVec<[(usize, DeadpoolStatusCounts); 4]>;
+
+fn pool_status_for<'s>(
+    snapshot: &'s PoolStatusSnapshot,
+    backend: &BackendInfo,
+) -> Option<&'s DeadpoolStatusCounts> {
+    let index = backend.id.as_index();
+    snapshot
+        .iter()
+        .find_map(|(sampled, status)| (*sampled == index).then_some(status))
+}
+
+/// Capacity weight for selection, taken from the per-tier sample when present.
+fn pool_weight(snapshot: &PoolStatusSnapshot, backend: &BackendInfo) -> usize {
+    pool_status_for(snapshot, backend)
+        .map_or_else(|| backend.provider.max_size(), |status| status.max_size)
 }
 
 /// Builder for selecting a backend.
@@ -677,6 +714,20 @@ impl BackendSelector {
         backend_id
     }
 
+    /// Pool counters sampled once per tier evaluation.
+    ///
+    /// `DeadpoolConnectionProvider::status_counts()` locks the same pool mutex
+    /// that `Pool::get()` takes, so sampling it per backend on every routed
+    /// command turned every client into a convoy on that mutex. One sample per
+    /// backend per tier keeps the routing decision off the contended path.
+    fn sample_pool_status(&self, tier: u8) -> PoolStatusSnapshot {
+        let mut snapshot = PoolStatusSnapshot::new();
+        for backend in self.backends.iter().filter(|backend| backend.tier == tier) {
+            snapshot.push((backend.id.as_index(), backend.provider.status_counts()));
+        }
+        snapshot
+    }
+
     /// Select the next backend using the configured strategy with tier-aware prioritization
     ///
     /// Selection is tier-aware: backends with lower tier numbers are tried first.
@@ -720,12 +771,16 @@ impl BackendSelector {
                 );
             }
 
+            let pool_status = self.sample_pool_status(tier);
+
             let tier_has_non_over_hard_backend = self.queue_backpressure_enabled
                 && self.backends.iter().any(|backend| {
                     if backend.tier != tier || !is_available(&backend) {
                         return false;
                     }
-                    let status = backend.provider.status_counts();
+                    let Some(status) = pool_status_for(&pool_status, backend) else {
+                        return true;
+                    };
                     let checked_out = status.size.saturating_sub(status.available);
                     let pending = backend.pending_count.get();
                     !self.exceeds_hard_queue_depth(
@@ -744,7 +799,9 @@ impl BackendSelector {
                 if !tier_has_non_over_hard_backend {
                     return true;
                 }
-                let status = b.provider.status_counts();
+                let Some(status) = pool_status_for(&pool_status, b) else {
+                    return true;
+                };
                 let checked_out = status.size.saturating_sub(status.available);
                 let pending = b.pending_count.get();
                 !self.exceeds_hard_queue_depth(
@@ -760,15 +817,17 @@ impl BackendSelector {
             {
                 match &self.strategy {
                     SelectionStrategy::WeightedRoundRobin(_) => self
-                        .select_capacity_weighted(tier_filter)
+                        .select_capacity_weighted(tier_filter, &pool_status)
                         .map(|backend| SelectedBackend {
                             backend,
                             pending_snapshot: None,
                         }),
-                    SelectionStrategy::LeastLoaded(_) => self.select_weighted(tier_filter),
+                    SelectionStrategy::LeastLoaded(_) => {
+                        self.select_weighted(tier_filter, &pool_status)
+                    }
                 }
             } else {
-                self.select_weighted(tier_filter)
+                self.select_weighted(tier_filter, &pool_status)
             };
             if tracing::enabled!(tracing::Level::DEBUG) {
                 self.debug_log_selection_candidates(
@@ -823,7 +882,11 @@ impl BackendSelector {
     }
 
     /// Select a backend by capacity weight, independent of current pending load.
-    fn select_capacity_weighted<F>(&self, filter: F) -> Option<&BackendInfo>
+    fn select_capacity_weighted<F>(
+        &self,
+        filter: F,
+        snapshot: &PoolStatusSnapshot,
+    ) -> Option<&BackendInfo>
     where
         F: Fn(&&BackendInfo) -> bool,
     {
@@ -831,7 +894,7 @@ impl BackendSelector {
             .backends
             .iter()
             .filter(&filter)
-            .map(|b| b.provider.max_size())
+            .map(|b| pool_weight(snapshot, b))
             .sum();
 
         if total_weight == 0 {
@@ -847,7 +910,7 @@ impl BackendSelector {
             .iter()
             .filter(&filter)
             .scan(0, |cumulative, backend| {
-                *cumulative += backend.provider.max_size();
+                *cumulative += pool_weight(snapshot, backend);
                 Some((*cumulative, backend))
             })
             .find(|(cumulative_weight, _)| position < *cumulative_weight)
@@ -1002,8 +1065,14 @@ impl BackendSelector {
     }
 
     #[allow(clippy::cast_precision_loss)]
-    fn backend_load_ratio_with_pending(&self, backend: &BackendInfo, pending: usize) -> LoadRatio {
-        let status = backend.provider.status_counts();
+    fn backend_load_ratio_with_pending(
+        &self,
+        backend: &BackendInfo,
+        pending: usize,
+        snapshot: &PoolStatusSnapshot,
+    ) -> LoadRatio {
+        let sampled = pool_status_for(snapshot, backend).copied();
+        let status = sampled.unwrap_or_else(|| backend.provider.status_counts());
         let max_conns = status.max_size as f64;
         if max_conns > 0.0 {
             let checked_out = status.size.saturating_sub(status.available);
@@ -1032,7 +1101,11 @@ impl BackendSelector {
     }
 
     /// Select a backend using weighted round-robin from backends matching the filter
-    fn select_weighted<F>(&self, filter: F) -> Option<SelectedBackend<'_>>
+    fn select_weighted<F>(
+        &self,
+        filter: F,
+        snapshot: &PoolStatusSnapshot,
+    ) -> Option<SelectedBackend<'_>>
     where
         F: Fn(&&BackendInfo) -> bool,
     {
@@ -1043,7 +1116,7 @@ impl BackendSelector {
                     .backends
                     .iter()
                     .filter(&filter)
-                    .map(|b| b.provider.max_size())
+                    .map(|b| pool_weight(snapshot, b))
                     .sum();
 
                 if total_weight == 0 {
@@ -1058,7 +1131,7 @@ impl BackendSelector {
                     .iter()
                     .filter(&filter)
                     .scan(0, |cumulative, backend| {
-                        *cumulative += backend.provider.max_size();
+                        *cumulative += pool_weight(snapshot, backend);
                         Some((*cumulative, backend))
                     })
                     .find(|(cumulative_weight, _)| position < *cumulative_weight)
@@ -1079,7 +1152,8 @@ impl BackendSelector {
 
                 for backend in self.backends.iter().filter(&filter) {
                     let pending_snapshot = backend.pending_count.get();
-                    let load = self.backend_load_ratio_with_pending(backend, pending_snapshot);
+                    let load =
+                        self.backend_load_ratio_with_pending(backend, pending_snapshot, snapshot);
                     match load
                         .partial_cmp(&selected_load)
                         .unwrap_or(std::cmp::Ordering::Greater)
@@ -1214,8 +1288,9 @@ impl BackendSelector {
             // Get max connections from the provider's pool
             let max_connections = backend.provider.max_size();
 
-            // Reserve 1 connection for per-command routing
-            let max_stateful = max_connections.saturating_sub(1);
+            // Reserve 1 connection for per-command routing, but keep a small
+            // pool usable for stateful clients instead of reserving all of it.
+            let max_stateful = max_connections.saturating_sub(1).max(1);
 
             // Try to acquire slot using StatefulCount's atomic logic
             let acquired = backend.stateful_count.try_acquire(max_stateful);
@@ -1240,6 +1315,23 @@ impl BackendSelector {
 
             acquired
         })
+    }
+
+    /// Reserve a stateful slot, releasing it when the returned guard drops.
+    ///
+    /// Callers that pin a connection to a client session should use this before
+    /// checking out so an over-capacity client fails immediately instead of
+    /// blocking for the entire pool wait timeout.
+    #[must_use]
+    pub fn try_reserve_stateful(
+        self: &Arc<Self>,
+        backend_id: BackendId,
+    ) -> Option<StatefulSlotGuard> {
+        self.try_acquire_stateful(backend_id)
+            .then(|| StatefulSlotGuard {
+                router: Arc::clone(self),
+                backend_id,
+            })
     }
 
     /// Release a stateful connection slot

@@ -848,9 +848,9 @@ impl ClientSession {
             .flat_map(|tier| router.backend_ids_in_tier(tier))
             .next()?;
         let provider = router.backend_provider(backend_id)?;
-        if provider.stat_missing_enabled() {
-            return None;
-        }
+        // `stat_missing` only spends a probe on retries, and a retried window
+        // falls back to the sequential path (`RetryAllSequentially`), so it does
+        // not block pipelining.
         let availability_slot = router.availability_slot(backend_id)?;
 
         Some(SingleBackendArticleWindow {

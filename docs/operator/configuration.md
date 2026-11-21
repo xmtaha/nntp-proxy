@@ -36,7 +36,7 @@ See [../../config.full.toml](../../config.full.toml) for a complete example.
 | --- | --- | --- |
 | `host` | `0.0.0.0` | Listen host |
 | `port` | `8119` | Listen port |
-| `threads` | `1` | Use `0` for CPU-count worker threads |
+| `threads` | CPU count | One per available core; `1` forces single-threaded |
 | `validate_yenc` | `true` | Validate yEnc structure/checksums |
 | `log_file_level` | `"warn"` | Filter for the optional local `debug.log` appender |
 | `response_write_metrics_secs` | unset | Optional interval for response write metrics logging |

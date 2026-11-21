@@ -138,14 +138,14 @@ impl QueuePressurePercent {
 ///
 /// Ensures thread pools always have at least 1 thread.
 /// Special handling: passing 0 to `new()` returns the number of CPU cores.
+/// The default is one worker per available CPU core: a single worker serializes
+/// every connection onto one core, which is the first thing to saturate when
+/// several clients connect at once.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ThreadCount(NonZeroUsize);
 
 impl ThreadCount {
-    /// Default thread count (single-threaded)
-    pub const DEFAULT: Self = Self(NonZeroUsize::new(1).unwrap());
-
     /// Create a new `ThreadCount`
     ///
     /// - If value is 0, returns the number of CPU cores
@@ -196,9 +196,8 @@ impl ThreadCount {
 }
 
 impl Default for ThreadCount {
-    /// Default to single-threaded (1 thread)
     fn default() -> Self {
-        Self(NonZeroUsize::new(1).unwrap())
+        Self::num_cpus()
     }
 }
 
@@ -426,7 +425,10 @@ mod tests {
     // Edge Cases - ThreadCount
     #[test]
     fn test_thread_count_default() {
-        assert_eq!(ThreadCount::default().get(), 1);
+        assert_eq!(
+            ThreadCount::default().get(),
+            std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+        );
     }
 
     #[test]

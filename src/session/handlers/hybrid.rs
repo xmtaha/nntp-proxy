@@ -46,6 +46,7 @@ struct StatefulBackendLease {
     connection: crate::pool::ConnectionGuard,
     backend_id: crate::types::BackendId,
     _pending_command: crate::router::CommandGuard,
+    _stateful_slot: crate::router::StatefulSlotGuard,
 }
 
 impl StatefulBackendLease {
@@ -53,11 +54,13 @@ impl StatefulBackendLease {
         connection: crate::pool::ConnectionGuard,
         backend_id: crate::types::BackendId,
         pending_command: crate::router::CommandGuard,
+        stateful_slot: crate::router::StatefulSlotGuard,
     ) -> Self {
         Self {
             connection,
             backend_id,
             _pending_command: pending_command,
+            _stateful_slot: stateful_slot,
         }
     }
 
@@ -291,6 +294,13 @@ impl ClientSession {
 
         let backend_id = router.route(crate::router::RouteRequest::new(self.client_id))?;
 
+        // Reserve the session's slot before checking out: once the client is
+        // pinned to this backend for the session, an over-capacity client must
+        // fail fast instead of waiting out the pool checkout timeout.
+        let stateful_slot = router
+            .try_reserve_stateful(backend_id)
+            .ok_or_else(|| anyhow::anyhow!("stateful capacity exhausted: {:?}", backend_id))?;
+
         // Guard pending_count immediately — if get_pooled_connection fails,
         // the guard drops and decrements automatically
         let pending_guard =
@@ -307,6 +317,7 @@ impl ClientSession {
             conn_guard,
             backend_id,
             pending_guard,
+            stateful_slot,
         ))
     }
 }

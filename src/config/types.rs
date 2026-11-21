@@ -148,7 +148,7 @@ pub struct Proxy {
     pub host: String,
     /// Port to listen on (default: 8119)
     pub port: Port,
-    /// Number of worker threads (default: 1, use 0 for CPU cores)
+    /// Number of worker threads (default: one per CPU core, use 1 for single-threaded)
     pub threads: ThreadCount,
     /// Routing mode for the proxy
     #[serde(skip_serializing)]

@@ -181,7 +181,9 @@ fn test_stateful_acquisition_with_max_connections_1() {
     let mut router = BackendSelector::new();
     let backend_id = BackendId::from_index(0);
 
-    // max_connections = 1 means max_stateful = 0 (need to reserve 1 for PCR)
+    // A one-slot pool cannot reserve a connection for PCR, so the slot stays
+    // stateful-capable: reserving it entirely would make hybrid mode unable to
+    // switch on this backend.
     let provider = DeadpoolConnectionProvider::new(
         "localhost".to_string(),
         9999,
@@ -197,9 +199,11 @@ fn test_stateful_acquisition_with_max_connections_1() {
         0, // tier
     );
 
-    // Should never be able to acquire stateful (all reserved for PCR)
+    assert!(router.try_acquire_stateful(backend_id));
+    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(1));
+
+    // The single slot is now taken, so a second client cannot acquire it.
     assert!(!router.try_acquire_stateful(backend_id));
-    assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(0));
 }
 
 #[test]

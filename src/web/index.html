@@ -296,7 +296,7 @@ const tdn = (x) => td(String(x), "num");
 
 /* Byte alanları {"bytes":N} nesnesi ya da düz sayı olabilir. */
 function num(x) {
-  if (x && typeof x === "object") return Number(x.bytes || 0) || 0;
+  if (x && typeof x === "object") return Number(x.bytes ?? x.secs ?? 0) || 0;
   const n = Number(x);
   return Number.isFinite(n) ? n : 0;
 }
@@ -719,7 +719,8 @@ function renderStats(s) {
   const views = Array.isArray(s.backend_views) ? s.backend_views : [];
   const bRows = views.map((v) => {
     const sv = v.server || {};
-    const st = v.stats || {};
+    /* Gerçek backend istatistikleri nested; düz alanlar eski sözleşme. */
+    const st = Object.assign({}, v, v.stats || {});
     const lr = v.load_ratio;
     return el("tr", {}, [
       td(sv.name || "#" + (st.backend_id !== undefined ? st.backend_id : "?")),

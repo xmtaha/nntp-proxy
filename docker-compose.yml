@@ -25,11 +25,13 @@ services:
       # "web admin token generated").
       NNTP_PROXY_WEB_TOKEN: change-me-to-a-long-random-token
       
-      # Backend server 0 (required - at least one server must be configured)
-      NNTP_SERVER_0_HOST: news.example.com
-      NNTP_SERVER_0_PORT: 119
-      NNTP_SERVER_0_NAME: "Primary News Server"
-      NNTP_SERVER_0_STAT_MISSING: 1  # Probe 430s with STAT on backends that support it
+      # Backend servers come from ./nntp-config/config.toml (mounted below).
+      # Any NNTP_SERVER_* variable here overrides the file, so leave them out
+      # while the volume is mounted. Uncomment these to run without a config.
+      # NNTP_SERVER_0_HOST: news.example.com
+      # NNTP_SERVER_0_PORT: 119
+      # NNTP_SERVER_0_NAME: "Primary News Server"
+      # NNTP_SERVER_0_STAT_MISSING: 1  # Probe 430s with STAT on backends that support it
       # NNTP_SERVER_0_USERNAME: your_username  # Optional: backend authentication
       # NNTP_SERVER_0_PASSWORD: your_password  # Optional: backend authentication
       # NNTP_SERVER_0_MAX_CONNECTIONS: 10      # Optional: max connections (default: 10)
@@ -66,14 +68,13 @@ services:
           cpus: '1'
           memory: 256M
     
-    # Optional: Mount a config directory instead of using env vars
-    # If you prefer TOML configuration, uncomment this and comment out NNTP_SERVER_* env vars above.
-    # Mount the directory, not the single file, and keep it writable: the web UI
-    # saves config.toml with an atomic rename and writes config.toml.bak beside it,
-    # so a :ro mount (or a single-file bind mount) breaks PUT /api/config.
-    # Put your config.toml inside ./nntp-config first.
-    # volumes:
-    #   - ./nntp-config:/etc/nntp-proxy:rw
+    # Config directory, mounted so the web UI can save it. Mount the directory,
+    # not the single file, and keep it writable: the web UI saves config.toml
+    # with an atomic rename and writes config.toml.bak beside it, so a :ro mount
+    # (or a single-file bind mount) breaks PUT /api/config.
+    # When config.toml exists it wins. Comment this out to run from env vars only.
+    volumes:
+      - ./nntp-config:/etc/nntp-proxy:rw
     
     # Optional: Logging configuration
     logging:

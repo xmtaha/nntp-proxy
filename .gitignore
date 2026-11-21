@@ -45,3 +45,6 @@ DEEP_DIVE_ANALYSIS.md
 
 # codegraph index
 .codegraph/
+
+# Local operator config, not for commit
+nntp-config/

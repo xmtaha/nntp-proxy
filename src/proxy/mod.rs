@@ -53,6 +53,8 @@ pub struct NntpProxy {
     pub(super) memory: Memory,
     /// Whether to use adaptive availability prechecking for STAT/HEAD
     pub(super) adaptive_precheck: bool,
+    /// Connections to open per backend during startup prewarming
+    pub(super) prewarm_count: usize,
     /// Timestamp (as epoch nanos) when last client disconnected (for idle detection)
     /// Uses epoch nanos since Instant isn't shareable across threads easily
     pub(super) last_activity_nanos: Arc<AtomicU64>,
@@ -178,7 +180,12 @@ impl NntpProxy {
     /// # Errors
     /// Returns any backend connection or handshake error from pool prewarming.
     pub async fn prewarm_connections(&self) -> Result<()> {
-        crate::pool::prewarm_pools(&self.connection_providers, &self.servers).await
+        crate::pool::prewarm_pools(
+            &self.connection_providers,
+            &self.servers,
+            self.prewarm_count,
+        )
+        .await
     }
 
     /// Get the list of servers

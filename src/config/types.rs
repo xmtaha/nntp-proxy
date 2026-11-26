@@ -162,6 +162,15 @@ pub struct Proxy {
     /// Accepts tracing filter directives: "error", "warn", "info", "debug", "trace"
     #[serde(default = "super::defaults::log_file_level")]
     pub log_file_level: String,
+    /// Number of backend connections opened per server during startup
+    /// prewarming. `0` disables prewarming and lets the pool fill on demand.
+    ///
+    /// Clamped to that server's `max_connections`. Keep this well below the
+    /// provider's concurrency cap: a full prewarm holds every allowed slot
+    /// open before a single client connected, so any other client sharing the
+    /// account starves and the pool times out.
+    #[serde(default = "super::defaults::prewarm_connections")]
+    pub prewarm_connections: usize,
     /// Interval in seconds for response/hot-path metrics logging. `None` disables it.
     #[serde(default = "super::defaults::response_write_metrics_secs")]
     pub response_write_metrics_secs: Option<u64>,
@@ -191,6 +200,7 @@ impl Default for Proxy {
             threads: ThreadCount::default(),
             validate_yenc: true,
             log_file_level: defaults::log_file_level(),
+            prewarm_connections: defaults::prewarm_connections(),
             response_write_metrics_secs: defaults::response_write_metrics_secs(),
             stats_file: None,
             routing_mode: RoutingMode::default(),

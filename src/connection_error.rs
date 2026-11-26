@@ -100,6 +100,20 @@ pub enum ConnectionError {
 }
 
 impl ConnectionError {
+    /// Report whether this failure came from acquiring a connection at all.
+    ///
+    /// A setup failure says the pool has no connection to hand out yet. Retrying
+    /// it immediately spends another full setup deadline on the same empty pool,
+    /// so callers must let the router pick another backend instead.
+    #[must_use]
+    pub fn is_setup_failure(&self) -> bool {
+        match self {
+            Self::PoolExhausted { .. } | Self::PoolClosed { .. } => true,
+            Self::IoError(error) => error.kind() == ErrorKind::TimedOut,
+            _ => false,
+        }
+    }
+
     pub fn dns_resolver_init(
         backend: impl Into<String>,
         source: impl StdError + Send + Sync + 'static,
@@ -168,6 +182,30 @@ mod tests {
         let conn_err: ConnectionError = io_err.into();
 
         assert!(matches!(conn_err, ConnectionError::IoError(_)));
+    }
+
+    #[test]
+    fn setup_failures_are_retried_by_nobody() {
+        let timed_out =
+            ConnectionError::IoError(std::io::Error::new(std::io::ErrorKind::TimedOut, "setup"));
+        assert!(timed_out.is_setup_failure());
+
+        let exhausted = ConnectionError::PoolExhausted {
+            backend: "backend1".to_string(),
+            max_size: 20,
+        };
+        assert!(exhausted.is_setup_failure());
+
+        let closed = ConnectionError::PoolClosed {
+            backend: "backend1".to_string(),
+        };
+        assert!(closed.is_setup_failure());
+
+        let refused = ConnectionError::IoError(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        ));
+        assert!(!refused.is_setup_failure());
     }
 
     #[test]

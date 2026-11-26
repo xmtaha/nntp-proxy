@@ -539,7 +539,10 @@ impl DeadpoolConnectionProvider {
                     managed::TimeoutType::Create | managed::TimeoutType::Recycle,
                 ) => ConnectionError::IoError(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    format!("Backend '{}' connection setup timed out", self.name),
+                    format!(
+                        "Backend '{}' connection setup timed out at the pool deadline (create or recycle)",
+                        self.name
+                    ),
                 )),
                 deadpool::managed::PoolError::Closed => ConnectionError::PoolClosed {
                     backend: self.name.to_string(),

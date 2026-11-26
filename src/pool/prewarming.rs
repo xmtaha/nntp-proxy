@@ -1,7 +1,9 @@
 //! Connection pool prewarming functionality
 //!
-//! This module handles warming up connection pools by creating all connections
-//! concurrently at startup, ensuring they're ready before accepting clients.
+//! Opens a small number of backend connections up front so the first client
+//! does not pay the handshake latency, then lets deadpool fill the rest of
+//! each pool on demand. Warming the full pool would claim every connection the
+//! provider allows before a single client is served.
 
 use anyhow::Result;
 use tracing::{debug, info, warn};
@@ -9,19 +11,19 @@ use tracing::{debug, info, warn};
 use crate::config::Server;
 use crate::pool::DeadpoolConnectionProvider;
 
-/// Prewarm a single pool by creating all connections concurrently
+/// Prewarm a single pool by creating up to `count` connections concurrently
 async fn prewarm_single_pool(
     provider: DeadpoolConnectionProvider,
     server_name: String,
-    max_connections: usize,
+    count: usize,
 ) -> Result<usize> {
     info!(
         "Prewarming pool for '{}' with {} connections",
-        server_name, max_connections
+        server_name, count
     );
 
-    // Create all connections concurrently
-    let tasks: Vec<_> = (0..max_connections)
+    // Create the connections concurrently
+    let tasks: Vec<_> = (0..count)
         .map(|i| {
             // Clone Arc references for each async task to satisfy Send + 'static bounds
             // Arc makes this cheap - only the pointer is cloned, not the underlying data
@@ -36,7 +38,7 @@ async fn prewarm_single_pool(
                         debug!(
                             "Created connection {}/{} for '{}'",
                             i + 1,
-                            max_connections,
+                            count,
                             server_name
                         );
                     })
@@ -46,7 +48,7 @@ async fn prewarm_single_pool(
         .collect();
 
     // Wait for all connections and count successes
-    let mut connections = Vec::with_capacity(max_connections);
+    let mut connections = Vec::with_capacity(count);
     for task in tasks {
         if let Ok(Some(conn)) = task.await {
             connections.push(conn);
@@ -60,14 +62,17 @@ async fn prewarm_single_pool(
 
     info!(
         "Pool '{}' ready: {}/{} connections created",
-        server_name, created, max_connections
+        server_name, created, count
     );
 
     Ok(created)
 }
 
 /// Prewarm all connection pools before accepting clients
-/// Creates all connections concurrently across all pools
+///
+/// Opens at most `prewarm_count` connections per server. The rest of each pool
+/// fills on demand, which keeps the startup footprint below the provider's
+/// concurrency cap instead of claiming every allowed slot up front.
 ///
 /// # Errors
 /// Returns any task join failure or backend prewarming error from the
@@ -75,28 +80,33 @@ async fn prewarm_single_pool(
 pub async fn prewarm_pools(
     providers: &[DeadpoolConnectionProvider],
     servers: &[Server],
+    prewarm_count: usize,
 ) -> Result<()> {
     info!("Prewarming all connection pools...");
+
+    let counts: Vec<usize> = servers
+        .iter()
+        .map(|server| prewarm_count.min(server.max_connections.get()))
+        .collect();
 
     // Prewarm all pools concurrently
     let tasks: Vec<_> = servers
         .iter()
+        .zip(&counts)
         .enumerate()
-        .map(|(i, server)| {
+        .map(|(i, (server, &count))| {
             let provider = providers[i].clone();
             let server_name = server.name.to_string();
-            let max_connections = server.max_connections.get();
 
-            tokio::spawn(prewarm_single_pool(provider, server_name, max_connections))
+            tokio::spawn(prewarm_single_pool(provider, server_name, count))
         })
         .collect();
 
     // Wait for all pools and collect results
     let mut total_created = 0;
-    let mut total_expected = 0;
+    let total_expected: usize = counts.iter().sum();
 
     for (task, server) in tasks.into_iter().zip(servers.iter()) {
-        total_expected += server.max_connections.get();
         match task.await {
             Ok(Ok(created)) => total_created += created,
             Ok(Err(e)) => warn!(
@@ -183,7 +193,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         // Prewarm the pools
-        let result = prewarm_pools(&providers, &servers).await;
+        let result = prewarm_pools(&providers, &servers, 2).await;
 
         // Should succeed with mock server
         assert!(result.is_ok());
@@ -222,7 +232,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let result = prewarm_pools(&providers, &servers).await;
+        let result = prewarm_pools(&providers, &servers, 2).await;
         assert!(result.is_ok());
     }
 
@@ -255,7 +265,7 @@ mod tests {
 
         // Prewarming should not fail even if server is unreachable
         // It logs warnings but returns Ok
-        let result = prewarm_pools(&providers, &servers).await;
+        let result = prewarm_pools(&providers, &servers, 2).await;
         assert!(result.is_ok());
     }
 
@@ -265,7 +275,7 @@ mod tests {
         let servers = vec![];
         let providers = vec![];
 
-        let result = prewarm_pools(&providers, &servers).await;
+        let result = prewarm_pools(&providers, &servers, 2).await;
         assert!(result.is_ok());
     }
 
@@ -287,6 +297,40 @@ mod tests {
         assert!(result.is_ok());
         let created = result.unwrap();
         assert_eq!(created, 3);
+    }
+
+    #[tokio::test]
+    async fn prewarm_opens_only_the_configured_count_not_the_pool_size() {
+        let (port, _server) = spawn_mock_server_on_random_port().await;
+
+        let servers = vec![
+            Server::builder("127.0.0.1", crate::types::Port::try_new(port).unwrap())
+                .name("CappedServer")
+                .max_connections(crate::types::MaxConnections::try_new(6).unwrap())
+                .build()
+                .unwrap(),
+        ];
+        let providers = servers
+            .iter()
+            .map(|s| {
+                crate::pool::DeadpoolConnectionProvider::new(
+                    s.host.to_string(),
+                    s.port.get(),
+                    s.name.to_string(),
+                    s.max_connections.get(),
+                    s.username.clone(),
+                    s.password.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        prewarm_pools(&providers, &servers, 2).await.unwrap();
+
+        let status = providers[0].status_counts();
+        assert_eq!(
+            status.size, 2,
+            "prewarm must stop at prewarm_connections, not max_connections"
+        );
     }
 
     #[tokio::test]
@@ -360,7 +404,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         // Should still return Ok even with partial failures
-        let result = prewarm_pools(&providers, &servers).await;
+        let result = prewarm_pools(&providers, &servers, 2).await;
         assert!(result.is_ok());
     }
 }

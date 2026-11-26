@@ -211,6 +211,18 @@ pub const fn disk_cache_shards() -> usize {
     4
 }
 
+/// Default number of backend connections opened during startup prewarming.
+///
+/// A full prewarm saturates the provider's concurrency allowance before any
+/// client asks for a connection, so it only buys the latency of the first
+/// request and risks the whole pool timing out against the provider cap. Two
+/// connections prove the backend answers; the pool fills on demand after that.
+#[inline]
+#[must_use]
+pub const fn prewarm_connections() -> usize {
+    2
+}
+
 /// Default backend idle timeout (10 minutes)
 ///
 /// After this duration of proxy-wide inactivity, idle backend connections are cleared.

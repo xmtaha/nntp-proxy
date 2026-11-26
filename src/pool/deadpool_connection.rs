@@ -598,6 +598,28 @@ impl TcpManager {
 // ============================================================================
 
 impl TcpManager {
+    /// Poll one connection setup stage under the shared setup deadline.
+    ///
+    /// `timeout_at` keeps the stages sharing one budget, and the error carries
+    /// the stage name so a stalled setup is attributable from the log alone.
+    async fn setup_stage<T: Send>(
+        &self,
+        deadline: tokio::time::Instant,
+        stage: &'static str,
+        future: impl std::future::Future<Output = Result<T, ConnectionError>> + Send,
+    ) -> Result<T, ConnectionError> {
+        match tokio::time::timeout_at(deadline, future).await {
+            Ok(result) => result,
+            Err(_) => Err(ConnectionError::IoError(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "Backend '{}' connection setup timed out during {stage}",
+                    self.name
+                ),
+            ))),
+        }
+    }
+
     /// Read one single-line setup reply using the same backend reply framing
     /// facade as normal commands.
     ///
@@ -874,31 +896,51 @@ impl managed::Manager for TcpManager {
     type Error = ConnectionError;
 
     async fn create(&self) -> Result<ReadyBackendConnection, ConnectionError> {
-        tokio::time::timeout(crate::constants::timeout::CONNECTION, async {
-            let mut stream = self.create_optimized_stream().await?;
-            let mut buffer = [0u8; 4096];
+        // One deadline for the whole setup: a slow greeting must not hand the
+        // authentication stage a fresh budget. Each stage names itself in the
+        // timeout so the log shows what the backend actually stalled on.
+        let deadline = tokio::time::Instant::now() + crate::constants::timeout::CONNECTION;
 
-            self.consume_greeting(&mut stream, &mut buffer).await?;
-            self.negotiate_auth(&mut stream, &mut buffer).await?;
+        let mut stream = self
+            .setup_stage(deadline, "connect", self.create_optimized_stream())
+            .await?;
+        let mut buffer = [0u8; 4096];
 
-            if self.send_mode_reader {
-                self.negotiate_mode_reader(&mut stream, &mut buffer).await?;
-            }
+        self.setup_stage(
+            deadline,
+            "greeting",
+            self.consume_greeting(&mut stream, &mut buffer),
+        )
+        .await?;
+        self.setup_stage(
+            deadline,
+            "authentication",
+            self.negotiate_auth(&mut stream, &mut buffer),
+        )
+        .await?;
 
-            if self.negotiate_compression(&mut stream, &mut buffer).await? {
-                let level = self.compression.level;
-                stream = stream.into_compressed(level)?;
-            }
+        if self.send_mode_reader {
+            self.setup_stage(
+                deadline,
+                "MODE READER",
+                self.negotiate_mode_reader(&mut stream, &mut buffer),
+            )
+            .await?;
+        }
 
-            Ok(ReadyBackendConnection::new(stream))
-        })
-        .await
-        .map_err(|_| {
-            ConnectionError::IoError(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("Backend '{}' connection setup timed out", self.name),
-            ))
-        })?
+        if self
+            .setup_stage(
+                deadline,
+                "COMPRESS DEFLATE",
+                self.negotiate_compression(&mut stream, &mut buffer),
+            )
+            .await?
+        {
+            let level = self.compression.level;
+            stream = stream.into_compressed(level)?;
+        }
+
+        Ok(ReadyBackendConnection::new(stream))
     }
 
     async fn recycle(
